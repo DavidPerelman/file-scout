@@ -1,5 +1,5 @@
-import sys  # Import sys to access command-line arguments and exit functionality
-import os   # Import os for os.startfile() to open files with their default application
+import sys   # Import sys to access command-line arguments and exit functionality
+import os    # Import os for os.startfile() to open files with their default application
 from PyQt6.QtWidgets import (  # Import all needed Qt widgets
     QApplication, QMainWindow, QWidget,  # Core window and container widgets
     QVBoxLayout, QHBoxLayout,  # Vertical and horizontal layout managers
@@ -10,7 +10,11 @@ from PyQt6.QtWidgets import (  # Import all needed Qt widgets
     QComboBox, QLineEdit  # Dropdown selector and single-line text input for the filter bar
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal  # Import Qt namespace, thread class, and signal type
-from PyQt6.QtGui import QIntValidator  # Validator that restricts a QLineEdit to integer input only
+from PyQt6.QtGui import (  # Import GUI-level classes
+    QIntValidator,  # Restricts a QLineEdit to integer input only
+    QColor,         # Used to set the yellow highlight background on matching filename cells
+    QBrush,         # Wraps QColor into a brush accepted by QTableWidgetItem.setBackground()
+)
 from datetime import datetime  # Import datetime for comparing file modification dates in the filter
 from send2trash import send2trash  # Import send2trash to move files to the Recycle Bin instead of permanently deleting them
 from scanner import scan_folder  # Import the folder scanning generator from scanner.py
@@ -89,6 +93,7 @@ FILE_TYPE_GROUPS: dict[str, set[str]] = {  # Maps each Hebrew category label to 
 }
 
 
+
 def _make_table(headers: list[str], stretch_col: int) -> QTableWidget:  # Helper that builds a configured read-only table with given headers
     table = QTableWidget()  # Create a new table widget
     table.setColumnCount(len(headers))  # Set column count to match the number of header labels
@@ -165,6 +170,16 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)  # Disable row selection entirely so the blue highlight indicators don't appear
         self.table.cellDoubleClicked.connect(self._on_scan_row_double_clicked)  # Open the file when the user double-clicks any cell in the scan table
 
+        # Search bar
+        self.search_input = QLineEdit()  # Full-width text input for filtering rows by filename
+        self.search_input.setPlaceholderText("חפש לפי שם קובץ...")  # Hint text shown when the field is empty
+        self.search_input.setClearButtonEnabled(True)  # Show a built-in × button so the user can clear the search in one click
+        self.search_input.textChanged.connect(self._apply_filters)  # Re-filter the visible rows on every keystroke
+
+        search_row = QHBoxLayout()  # Horizontal row that holds the label and the search input
+        search_row.addWidget(QLabel("חיפוש:"))  # Label identifies the purpose of the input field
+        search_row.addWidget(self.search_input, stretch=1)  # Input expands to fill all remaining horizontal space
+
         # Filter bar
         self.type_combo = QComboBox()  # Dropdown for filtering by file type category
         self.type_combo.addItems(["הכל", "תמונות", "מסמכים", "וידאו", "מוזיקה", "אחר"])  # Add all category options including "Other"
@@ -193,9 +208,10 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
 
         scan_tab_widget = QWidget()  # Container widget that holds the filter bar and scan table for tab 1
         scan_tab_layout = QVBoxLayout(scan_tab_widget)  # Vertical layout stacks the filter bar above the table
-        scan_tab_layout.setContentsMargins(0, 4, 0, 0)  # Small top margin so the filter bar doesn't touch the tab edge
-        scan_tab_layout.setSpacing(4)  # Small gap between filter bar and table
-        scan_tab_layout.addLayout(filter_bar)  # Filter bar sits at the top of the tab
+        scan_tab_layout.setContentsMargins(0, 4, 0, 0)  # Small top margin so the search bar doesn't touch the tab edge
+        scan_tab_layout.setSpacing(4)  # Small gap between each row in the tab
+        scan_tab_layout.addLayout(search_row)  # Search bar sits at the very top of the tab
+        scan_tab_layout.addLayout(filter_bar)  # Filter bar sits directly below the search bar
         scan_tab_layout.addWidget(self.table, stretch=1)  # Table expands to fill all remaining vertical space
 
         self.tabs.addTab(scan_tab_widget, "סריקה")  # Add the container as the first tab labelled "Scan"
@@ -415,6 +431,7 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         min_bytes   = int(size_text) * 1024 if size_text.isdigit() and int(size_text) > 0 else 0  # Convert KB to bytes; 0 means no size filter
         date_label  = self.date_combo.currentText()   # Currently selected date range ("הכל" means no date filter)
         today       = datetime.now().date()           # Today's date used as the anchor for all relative date comparisons
+        search_term = self.search_input.text().lower()  # Lowercased search string; empty string means no name filter
 
         visible_count = 0  # Running count of rows that pass all filters
         visible_bytes = 0  # Running total bytes of visible rows for the status bar
@@ -441,6 +458,10 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
             if not hide and file["size_bytes"] < min_bytes:  # Hide files smaller than the minimum
                 hide = True
 
+            # Search filter
+            if not hide and search_term and search_term not in file["name"].lower():  # Non-empty term that does not appear in the filename → hide
+                hide = True
+
             # Date filter
             if not hide and date_label != "הכל":  # "הכל" = show all dates
                 mod = file["modified_date"].date()  # Extract just the date part from the stored datetime object
@@ -453,7 +474,12 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
                 elif date_label == "השנה":
                     hide = mod.year != today.year  # Same calendar year
 
-            self.table.setRowHidden(row, hide)  # Apply the decision to this row
+            self.table.setRowHidden(row, hide)  # Apply the visibility decision to this row
+
+            highlight = not hide and bool(search_term)  # Yellow background only when a search is active and this row matched it
+            name_item.setBackground(  # Paint the filename cell to give the user a clear visual indicator of which rows matched
+                QBrush(QColor(255, 255, 180)) if highlight else QBrush()  # Soft yellow for matches; default (null) brush resets to the normal cell colour
+            )
 
             if not hide:  # Accumulate stats only for rows that remain visible
                 visible_count += 1
