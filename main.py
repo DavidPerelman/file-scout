@@ -7,7 +7,10 @@ from PyQt6.QtWidgets import (  # Import all needed Qt widgets
     QTableWidget, QTableWidgetItem,  # Table widget and its cell item class
     QHeaderView, QFileDialog,  # Header behavior control and folder picker dialog
     QTabWidget, QProgressBar, QMessageBox,  # Tab container, progress bar, and confirmation dialog widgets
-    QComboBox, QLineEdit  # Dropdown selector and single-line text input for the filter bar
+    QComboBox, QLineEdit,  # Dropdown selector and single-line text input for the filter bar
+    QListWidget,  # List widget used in the cleanup tab to display the selected root paths
+    QSpinBox,  # Integer spinbox used in the cleanup tab for the large-file size threshold
+    QScrollArea,  # Scrollable viewport that wraps the three cleanup result sections
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal  # Import Qt namespace, thread class, and signal type
 from PyQt6.QtGui import (  # Import GUI-level classes
@@ -15,7 +18,8 @@ from PyQt6.QtGui import (  # Import GUI-level classes
     QColor,         # Used to set the yellow highlight background on matching filename cells
     QBrush,         # Wraps QColor into a brush accepted by QTableWidgetItem.setBackground()
 )
-from datetime import datetime  # Import datetime for comparing file modification dates in the filter
+from datetime import datetime, timedelta  # Import datetime for date comparisons; timedelta for the "older than N months" cutoff
+from pathlib import Path  # Import Path for the module-level _walk_clean helper used by CleanupWorker
 from send2trash import send2trash  # Import send2trash to move files to the Recycle Bin instead of permanently deleting them
 from scanner import scan_folder  # Import the folder scanning generator from scanner.py
 from duplicates import find_duplicates  # Import the duplicate detection function from duplicates.py
@@ -69,6 +73,53 @@ class DuplicatesWorker(QThread):  # Worker that runs find_duplicates() on a back
             self.error.emit(str(e))  # Emit the error message so the main thread can display it
 
 
+class CleanupWorker(QThread):  # Worker that scans one or more root paths, then hashes for duplicates, entirely on the background thread
+    total_files   = pyqtSignal(int)  # Emitted once before scanning begins with the combined file count, so the progress bar can set its maximum
+    progress      = pyqtSignal(int)  # Emitted after each file is discovered during the scan pass; drives progress bar + status label
+    hash_start    = pyqtSignal(int)  # Emitted once before hashing begins with len(files) as the new bar maximum; resets the bar for the hash phase
+    hash_progress = pyqtSignal(int)  # Emitted after each file is hashed; drives only progress bar setValue — never touches the status label
+    finished      = pyqtSignal(list, dict)  # Emitted with (file_list, duplicates_dict) when both scan and hash passes complete
+    error         = pyqtSignal(str)  # Emitted with an error message string if any unrecoverable exception is raised
+
+    def __init__(self, roots: list[str]):  # Accept the list of root paths chosen in the multi-root picker
+        super().__init__()  # Initialise the parent QThread
+        self._roots = roots  # Store the root list so run() can access it; never mutated after construction
+
+    def run(self):  # Qt calls this in the background thread when start() is invoked
+        try:
+            # --- Pre-count pass: use _walk_clean so the count matches what the scan pass will actually visit ---
+            total = sum(
+                sum(1 for _ in _walk_clean(Path(root)))  # Count accessible, non-skipped files under this root
+                for root in self._roots
+            )
+            self.total_files.emit(total)  # Send the combined total so the progress bar switches from indeterminate to percentage mode
+
+            # --- Scan pass: iterate _walk_clean for every root and build file dicts on the fly ---
+            files = []  # Flat list that collects file dicts from all roots in sequence
+            for root in self._roots:
+                for entry in _walk_clean(Path(root)):  # Same skip-aware, PermissionError-safe walk as the count pass
+                    try:
+                        stat = entry.stat()  # Read filesystem metadata; may raise OSError if the file vanished between discovery and stat
+                    except OSError:
+                        continue  # Skip any file that can no longer be read without aborting the whole scan
+                    files.append({  # Build the same file-dict shape that scanner.py produces so all downstream code stays compatible
+                        "name":          entry.name,
+                        "size_bytes":    stat.st_size,
+                        "file_type":     entry.suffix.lstrip(".").lower(),
+                        "modified_date": datetime.fromtimestamp(stat.st_mtime),
+                        "folder":        str(entry.parent),
+                    })
+                    self.progress.emit(len(files))  # Advance the progress bar one step per file
+
+            # --- Hash pass: find duplicates among the collected files on this thread so the main thread stays responsive ---
+            self.hash_start.emit(len(files))  # Signal the main thread to reset the progress bar for the hash phase
+            duplicates = find_duplicates(files, on_progress=self.hash_progress.emit)  # Reuse duplicates.py; hash_progress drives only the bar
+            self.finished.emit(files, duplicates)  # Deliver both the file list and the duplicates dict in a single signal
+
+        except Exception as e:  # Catch any unexpected error not already handled inside the loops
+            self.error.emit(str(e))  # Emit the message so the main thread can display it in the status bar
+
+
 # ---------------------------------------------------------------------------
 # Formatting helpers
 # ---------------------------------------------------------------------------
@@ -92,6 +143,44 @@ FILE_TYPE_GROUPS: dict[str, set[str]] = {  # Maps each Hebrew category label to 
     "מוזיקה": {"mp3", "wav", "flac", "aac", "ogg", "wma", "m4a", "opus", "aiff"},
 }
 
+# ---------------------------------------------------------------------------
+# Cleanup walk helpers
+# ---------------------------------------------------------------------------
+
+# Directory path prefixes that CleanupWorker never recurses into (case-insensitive).
+# These are system-owned trees where user storage savings are impossible or dangerous.
+_CLEANUP_SKIP_PREFIXES: tuple[str, ...] = (
+    r"C:\Windows",                       # OS installation files
+    r"C:\$Recycle.Bin",                  # Recycle Bin staging area
+    r"C:\System Volume Information",     # System restore / VSS snapshots
+    r"C:\Program Files",                 # 64-bit application installs
+    r"C:\Program Files (x86)",           # 32-bit application installs (covers both with the prefix check)
+)
+
+# Substrings that cause a directory to be skipped wherever they appear in its path.
+_CLEANUP_SKIP_SUBSTRINGS: tuple[str, ...] = (
+    r"\AppData\Local\Temp",  # Per-user temp files managed by the OS; safe to ignore, risky to delete
+)
+
+
+def _walk_clean(root: Path):  # Yield Path objects for every accessible file under root, honouring the skip lists
+    stack = [root]  # Iterative depth-first walk; start with the root so we never hit Python's recursion limit
+    while stack:  # Process directories until none remain
+        current = stack.pop()  # Take the next directory off the stack
+        try:
+            for entry in current.iterdir():  # List the immediate contents of this directory
+                if entry.is_file():  # Plain files are yielded immediately for the caller to process
+                    yield entry
+                elif entry.is_dir():  # Subdirectories are only queued if they pass the skip checks
+                    s = str(entry).lower()  # Lowercase once so every comparison below is case-insensitive
+                    skip = (
+                        any(s.startswith(p.lower()) for p in _CLEANUP_SKIP_PREFIXES)    # Matches a protected root prefix
+                        or any(sub.lower() in s for sub in _CLEANUP_SKIP_SUBSTRINGS)    # Contains a protected substring anywhere in the path
+                    )
+                    if not skip:
+                        stack.append(entry)  # Safe to recurse — add to the work queue
+        except OSError:  # Covers PermissionError and any other OS-level access failure; skip the directory silently
+            pass
 
 
 def _make_table(headers: list[str], stretch_col: int) -> QTableWidget:  # Helper that builds a configured read-only table with given headers
@@ -251,6 +340,197 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
 
         self.tabs.addTab(dup_tab_widget, "כפילויות")  # Add the container as the second tab labelled "Duplicates"
 
+        # Tab 3 — Storage Cleanup
+        # --- Root picker section ---
+        self.cleanup_roots_list = QListWidget()  # Displays the list of root folders the user has added for cleanup scanning
+        self.cleanup_roots_list.setFixedHeight(100)  # Keep the list compact so it doesn't crowd the sections below it
+        self.cleanup_roots_list.itemSelectionChanged.connect(self._on_cleanup_selection_changed)  # Enable/disable the Remove button based on whether an item is selected
+
+        self.cleanup_add_btn = QPushButton("הוסף תיקייה")  # Opens a folder picker dialog and appends the chosen path to the list
+        self.cleanup_add_btn.setFixedWidth(120)  # Consistent button width
+        self.cleanup_add_btn.clicked.connect(self._on_cleanup_add_root)  # Connect to the add handler
+
+        self.cleanup_remove_btn = QPushButton("הסר")  # Removes the currently selected path from the list
+        self.cleanup_remove_btn.setFixedWidth(80)  # Consistent button width
+        self.cleanup_remove_btn.setEnabled(False)  # Disabled until the user selects an item in the list
+        self.cleanup_remove_btn.clicked.connect(self._on_cleanup_remove_root)  # Connect to the remove handler
+
+        self.cleanup_scan_btn = QPushButton("סרוק")  # Starts the CleanupWorker once at least one root has been added
+        self.cleanup_scan_btn.setFixedWidth(80)  # Consistent button width
+        self.cleanup_scan_btn.setEnabled(False)  # Disabled until at least one root is present in the list
+        self.cleanup_scan_btn.clicked.connect(self._start_cleanup_scan)  # Wire click to the cleanup scan handler
+
+        roots_btn_row = QHBoxLayout()  # Horizontal row that holds the three action buttons for the root picker
+        roots_btn_row.addWidget(self.cleanup_add_btn)   # "Add folder" on the right (RTL)
+        roots_btn_row.addWidget(self.cleanup_remove_btn)  # "Remove" next to it
+        roots_btn_row.addStretch()  # Push buttons right, leaving space on the left
+        roots_btn_row.addWidget(self.cleanup_scan_btn)  # "Scan" pinned to the left edge (RTL: right in layout)
+
+        roots_section = QVBoxLayout()  # Vertical stack for the root-picker header label, list, and buttons
+        roots_section.setSpacing(4)  # Compact spacing between label, list, and buttons
+        roots_section.addWidget(QLabel("תיקיות לסריקה:"))  # Section label: "Folders to scan:"
+        roots_section.addWidget(self.cleanup_roots_list)  # The list of root paths
+        roots_section.addLayout(roots_btn_row)  # Action buttons below the list
+
+        cleanup_tab_widget = QWidget()  # Container widget for the entire cleanup tab
+        cleanup_tab_layout = QVBoxLayout(cleanup_tab_widget)  # Vertical layout stacks the root picker above future sections
+        cleanup_tab_layout.setContentsMargins(0, 4, 0, 0)  # Small top margin so content doesn't touch the tab edge
+        cleanup_tab_layout.setSpacing(8)  # Gap between sections
+        cleanup_tab_layout.addLayout(roots_section)  # Root picker stays fixed above the scroll area so it is always visible
+
+        # Scroll content widget — wraps all three result sections so the tab is usable at any window height
+        scroll_content = QWidget()  # Content widget whose layout holds Large Files, Old Files, and Heavy Folders
+        scroll_content_layout = QVBoxLayout(scroll_content)  # Vertical stack for the three result sections
+        scroll_content_layout.setContentsMargins(0, 4, 4, 4)  # Small right/bottom margins so content doesn't crowd the scrollbar
+        scroll_content_layout.setSpacing(16)  # Generous gap between sections so they read as visually distinct groups
+
+        scroll_area = QScrollArea()  # Scrollable viewport that gives each section room regardless of window height
+        scroll_area.setWidget(scroll_content)  # Attach the content widget to the viewport
+        scroll_area.setWidgetResizable(True)  # CRITICAL: allows the content widget to resize horizontally with the tab width
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)  # Only vertical scrolling is needed here
+
+        cleanup_tab_layout.addWidget(scroll_area, stretch=1)  # Scroll area expands to fill all space below the root picker
+
+        # --- Large Files section ---
+        self.large_size_spin = QSpinBox()  # Threshold: only files at or above this size (in MB) are shown as large
+        self.large_size_spin.setRange(1, 100_000)  # 1 MB to ~100 GB expressed in megabytes
+        self.large_size_spin.setValue(100)  # Sensible default: flag files of 100 MB or more
+        self.large_size_spin.setSuffix(" MB")  # Unit label appended to the displayed number
+
+        self.large_files_table = _make_table(  # Checkbox table that lists files exceeding the size threshold
+            ["", "שם", "גודל", "תיקייה"],  # Col 0 = checkbox; then Name, Size, Folder
+            stretch_col=3,  # Stretch the Folder column to fill remaining width
+        )
+        self.large_files_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)  # No blue row highlight — checkboxes are the selection mechanism
+        self.large_files_table.setMinimumHeight(150)  # Ensure the table is usable even when no results have been loaded yet
+
+        self.large_files_label = QLabel("0 קבצים גדולים | 0 MB")  # Summary line updated by _on_cleanup_done in Task 8
+        self.large_files_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # Right-align for RTL consistency
+
+        self.large_delete_btn = QPushButton("מחק נבחרים")  # Sends checked large files to the Recycle Bin
+        self.large_delete_btn.setEnabled(False)  # Disabled until Task 8 populates the table with results
+        self.large_delete_btn.clicked.connect(
+            lambda: self._delete_checked_rows(self.large_files_table, name_col=1, folder_col=3)
+        )
+
+        large_header = QHBoxLayout()  # Header row: section title on the right, threshold control on the left (RTL)
+        large_header.addWidget(QLabel("קבצים גדולים"))  # Section title
+        large_header.addStretch()  # Push the threshold control to the opposite end
+        large_header.addWidget(QLabel("גודל מינימלי:"))  # Spinbox label
+        large_header.addWidget(self.large_size_spin)  # The threshold spinbox
+
+        large_footer = QHBoxLayout()  # Footer row: summary label on the right, delete button on the left (RTL)
+        large_footer.addWidget(self.large_files_label)  # Summary: "X קבצים גדולים | Y MB"
+        large_footer.addStretch()
+        large_footer.addWidget(self.large_delete_btn)
+
+        large_section = QVBoxLayout()  # Stacks header → table → footer vertically
+        large_section.setSpacing(4)
+        large_section.addLayout(large_header)
+        large_section.addWidget(self.large_files_table, stretch=1)  # Table expands to fill all available space in this section
+        large_section.addLayout(large_footer)
+
+        scroll_content_layout.addLayout(large_section)  # Large Files section — first in the scrollable area
+
+        # --- Old Files section ---
+        self.old_months_spin = QSpinBox()  # Threshold: files not modified within this many months are considered old
+        self.old_months_spin.setRange(1, 120)  # 1 month to 10 years
+        self.old_months_spin.setValue(6)  # Sensible default: flag files untouched for 6 months or more
+        self.old_months_spin.setSuffix(" חודשים")  # Unit label: "months"
+
+        self.old_files_table = _make_table(  # Checkbox table that lists files older than the threshold
+            ["", "שם", "גודל", "תאריך שינוי", "תיקייה"],  # Col 0 = checkbox; then Name, Size, Modified Date, Folder
+            stretch_col=4,  # Stretch the Folder column to fill remaining width
+        )
+        self.old_files_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)  # No blue row highlight — checkboxes are the selection mechanism
+        self.old_files_table.setMinimumHeight(150)  # Ensure the table is usable even when no results have been loaded yet
+
+        self.old_files_label = QLabel("0 קבצים ישנים | 0 MB")  # Summary line updated by _on_cleanup_done in Task 8
+        self.old_files_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # Right-align for RTL consistency
+
+        self.old_delete_btn = QPushButton("מחק נבחרים")  # Sends checked old files to the Recycle Bin
+        self.old_delete_btn.setEnabled(False)  # Disabled until Task 8 populates the table with results
+        self.old_delete_btn.clicked.connect(
+            lambda: self._delete_checked_rows(self.old_files_table, name_col=1, folder_col=4)
+        )
+
+        old_header = QHBoxLayout()  # Header row: section title on the right, threshold control on the left (RTL)
+        old_header.addWidget(QLabel("קבצים ישנים"))  # Section title
+        old_header.addStretch()  # Push the threshold control to the opposite end
+        old_header.addWidget(QLabel("לא שונה מזה:"))  # Spinbox label: "Not modified for:"
+        old_header.addWidget(self.old_months_spin)  # The threshold spinbox
+
+        old_footer = QHBoxLayout()  # Footer row: summary label on the right, delete button on the left (RTL)
+        old_footer.addWidget(self.old_files_label)  # Summary: "X קבצים ישנים | Y MB"
+        old_footer.addStretch()
+        old_footer.addWidget(self.old_delete_btn)
+
+        old_section = QVBoxLayout()  # Stacks header → table → footer vertically
+        old_section.setSpacing(4)
+        old_section.addLayout(old_header)
+        old_section.addWidget(self.old_files_table, stretch=1)  # Table expands to fill all available space in this section
+        old_section.addLayout(old_footer)
+
+        scroll_content_layout.addLayout(old_section)  # Old Files section — second in the scrollable area
+
+        # --- Heavy Folders section ---
+        # Display-only — shows the 10 immediate-parent folders with the highest combined file size.
+        # No threshold spinbox and no delete button: this section is informational only.
+        self.heavy_folders_table = _make_table(  # Read-only table listing the top-10 heaviest folders
+            ["תיקייה", "גודל כולל", "קבצים"],  # Folder path, combined size of direct children, file count
+            stretch_col=0,  # Stretch the Folder column; Size and Count columns fit their content
+        )
+        self.heavy_folders_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)  # Display-only — nothing to act on
+        self.heavy_folders_table.setMinimumHeight(150)  # Ensure the table is usable even when no results have been loaded yet
+
+        heavy_header = QHBoxLayout()  # Header row: section title on the right (RTL)
+        heavy_header.addWidget(QLabel("תיקיות כבדות"))  # Section title: "Heavy Folders"
+        heavy_header.addStretch()  # Remaining space left empty — no threshold control needed for this section
+
+        heavy_section = QVBoxLayout()  # Stacks header → table vertically
+        heavy_section.setSpacing(4)
+        heavy_section.addLayout(heavy_header)
+        heavy_section.addWidget(self.heavy_folders_table, stretch=1)  # Table expands to fill all available space in this section
+
+        scroll_content_layout.addLayout(heavy_section)  # Heavy Folders section — third in the scrollable area
+
+        # --- Duplicate Files section ---
+        self.cleanup_dup_table = _make_table(  # Checkbox table listing duplicate file copies found during the hash pass
+            ["", "שם", "גודל", "תיקייה"],  # Col 0 = checkbox; then Name, Size, Folder — same shape as large/old tables
+            stretch_col=3,  # Stretch the Folder column to fill remaining width
+        )
+        self.cleanup_dup_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)  # No blue row highlight — checkboxes are the selection mechanism
+        self.cleanup_dup_table.setMinimumHeight(150)  # Ensure the table is usable even when no results have been loaded yet
+
+        self.cleanup_dup_label = QLabel("0 קבוצות כפולות | ניתן לפנות: 0 MB")  # Summary updated by _populate_cleanup_duplicates
+        self.cleanup_dup_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # Right-align for RTL consistency
+
+        self.cleanup_dup_delete_btn = QPushButton("מחק נבחרים")  # Sends checked duplicate copies to the Recycle Bin
+        self.cleanup_dup_delete_btn.setEnabled(False)  # Disabled until _populate_cleanup_duplicates finds at least one group
+        self.cleanup_dup_delete_btn.clicked.connect(
+            lambda: self._delete_checked_rows(self.cleanup_dup_table, name_col=1, folder_col=3)
+        )
+
+        dup_cleanup_header = QHBoxLayout()  # Header row: section title on the right (RTL); no threshold control needed
+        dup_cleanup_header.addWidget(QLabel("קבצים כפולים"))  # Section title: "Duplicate Files"
+        dup_cleanup_header.addStretch()
+
+        dup_cleanup_footer = QHBoxLayout()  # Footer row: summary label on the right, delete button on the left (RTL)
+        dup_cleanup_footer.addWidget(self.cleanup_dup_label)
+        dup_cleanup_footer.addStretch()
+        dup_cleanup_footer.addWidget(self.cleanup_dup_delete_btn)
+
+        dup_cleanup_section = QVBoxLayout()  # Stacks header → table → footer vertically
+        dup_cleanup_section.setSpacing(4)
+        dup_cleanup_section.addLayout(dup_cleanup_header)
+        dup_cleanup_section.addWidget(self.cleanup_dup_table, stretch=1)  # Table expands to fill all available space in this section
+        dup_cleanup_section.addLayout(dup_cleanup_footer)
+
+        scroll_content_layout.addLayout(dup_cleanup_section)  # Duplicate Files section — last in the scrollable area
+        scroll_content_layout.addStretch()  # Push all four sections to the top when the content is shorter than the viewport
+
+        self.tabs.addTab(cleanup_tab_widget, "ניקוי אחסון")  # Add as the third tab labelled "Storage Cleanup"
+
         main_layout.addWidget(self.tabs, stretch=1)  # Add the tab widget and let it expand to fill available vertical space
 
         # --- Bottom Status Bar ---
@@ -333,6 +613,93 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         self.dup_btn.setEnabled(True)  # Re-enable so the user can try again
         self.select_btn.setEnabled(True)  # Re-enable the scan button as well
         self.status_label.setText(f"שגיאה: {message}")  # Display the error in the status bar
+
+    # --- Cleanup root picker ---
+
+    def _on_cleanup_add_root(self):  # Called when the user clicks "הוסף תיקייה"
+        path = QFileDialog.getExistingDirectory(  # Open a native folder picker dialog
+            self,  # Parent widget centers the dialog over the main window
+            "בחר תיקייה לסריקה",  # Dialog title: "Select folder to scan"
+            "",  # Let the OS choose the starting directory
+        )
+        if not path:  # User cancelled — path is an empty string
+            return
+
+        existing = [self.cleanup_roots_list.item(i).text()  # Build a list of already-added paths
+                    for i in range(self.cleanup_roots_list.count())]
+        if path in existing:  # Skip duplicates — the same root cannot appear twice
+            return
+
+        self.cleanup_roots_list.addItem(path)  # Append the new path to the visible list
+        self._on_cleanup_roots_changed()  # Update the scan button state
+
+    def _on_cleanup_remove_root(self):  # Called when the user clicks "הסר"
+        selected = self.cleanup_roots_list.selectedItems()  # Get the currently highlighted items
+        for item in selected:  # Remove each selected item (usually just one)
+            self.cleanup_roots_list.takeItem(self.cleanup_roots_list.row(item))  # Remove by row index
+        self._on_cleanup_roots_changed()  # Update the scan button state
+
+    def _on_cleanup_selection_changed(self):  # Called whenever the selection in the roots list changes
+        has_selection = bool(self.cleanup_roots_list.selectedItems())  # True if at least one item is highlighted
+        self.cleanup_remove_btn.setEnabled(has_selection)  # Enable Remove only when something is selected
+
+    def _on_cleanup_roots_changed(self):  # Updates button states whenever the roots list contents change
+        has_roots = self.cleanup_roots_list.count() > 0  # True if at least one root has been added
+        self.cleanup_scan_btn.setEnabled(has_roots)  # Enable Scan only when there is something to scan
+
+    # --- Cleanup scan flow ---
+
+    def _start_cleanup_scan(self):  # Called when the user clicks "סרוק" in the cleanup tab
+        roots = [
+            self.cleanup_roots_list.item(i).text()  # Read each root path from the list widget by index
+            for i in range(self.cleanup_roots_list.count())
+        ]
+
+        self.cleanup_scan_btn.setEnabled(False)   # Prevent a second scan from starting while one is already running
+        self.cleanup_add_btn.setEnabled(False)    # Disable Add so the root list cannot change mid-scan
+        self.cleanup_remove_btn.setEnabled(False) # Disable Remove for the same reason
+
+        self.progress_bar.setMaximum(0)   # Reset to indeterminate (pulsing) mode until the worker emits the real total
+        self.progress_bar.setValue(0)     # Clear the fill before the new scan starts
+        self.progress_bar.show()          # Reveal the progress bar while scanning is in progress
+        self.status_label.setText("סורק לניקוי...")  # "Scanning for cleanup…"
+
+        self.cleanup_worker = CleanupWorker(roots)  # Store as self.cleanup_worker — CRITICAL: a local variable would be garbage-collected immediately
+        self.cleanup_worker.total_files.connect(self.progress_bar.setMaximum)      # Switch bar from indeterminate to percentage mode when the scan total arrives
+        self.cleanup_worker.progress.connect(self.progress_bar.setValue)         # Advance the bar one step per file during the scan pass
+        self.cleanup_worker.progress.connect(self._on_cleanup_scan_progress)     # Update the status label with the live scan count
+        self.cleanup_worker.hash_start.connect(self._on_cleanup_hash_start)      # Reset bar and status label when the hash pass begins
+        self.cleanup_worker.hash_progress.connect(self.progress_bar.setValue)    # Advance the bar one step per file during the hash pass — no status label side-effect
+        self.cleanup_worker.finished.connect(self._on_cleanup_done)              # Connect finished signal BEFORE start()
+        self.cleanup_worker.error.connect(self._on_cleanup_error)                # Connect error signal BEFORE start()
+        self.cleanup_worker.start()                                               # Launch the background thread
+
+    def _on_cleanup_scan_progress(self, count: int):  # Called on the main thread each time the worker finds another file during the scan pass
+        self.status_label.setText(f"סורק לניקוי... {count} קבצים")  # Live count so the user sees progress during long scans
+
+    def _on_cleanup_hash_start(self, total: int):  # Called on the main thread when the worker transitions from scanning to hashing
+        self.progress_bar.setMaximum(total)  # Reset the bar maximum to the number of files about to be hashed
+        self.progress_bar.setValue(0)        # Reset the fill so the bar sweeps from 0 % to 100 % again during hashing
+        self.status_label.setText("מחפש כפילויות...")  # "Finding duplicates…" — stays fixed while hash_progress silently drives the bar
+
+    def _on_cleanup_done(self, files: list[dict], duplicates: dict):  # Called on the main thread when CleanupWorker emits finished(files, duplicates) — safe to update UI here
+        self._cleanup_files = files  # Cache the file list in case the user re-runs with changed thresholds
+        self.progress_bar.hide()  # Hide the progress bar now that both scan and hash passes are complete
+        self.cleanup_scan_btn.setEnabled(True)   # Re-enable so the user can re-scan after changing roots or thresholds
+        self.cleanup_add_btn.setEnabled(True)    # Re-enable the Add button
+        self._on_cleanup_roots_changed()         # Re-evaluate Remove/Scan enabled states based on current list contents
+        self._populate_large_files(files)        # Fill the Large Files section with files that exceed the spinbox threshold
+        self._populate_old_files(files)          # Fill the Old Files section with files older than the spinbox threshold
+        self._populate_heavy_folders(files)      # Fill the Heavy Folders section with the top-10 heaviest immediate-parent folders
+        self._populate_cleanup_duplicates(duplicates)  # Fill the Duplicate Files section with the hashing results from the worker
+        self.status_label.setText(f"סיום סריקה — {len(files)} קבצים")  # "Scan complete — X files"
+
+    def _on_cleanup_error(self, message: str):  # Called on the main thread when CleanupWorker emits error
+        self.progress_bar.hide()  # Hide the progress bar since the operation ended with failure
+        self.cleanup_scan_btn.setEnabled(True)   # Re-enable so the user can try again
+        self.cleanup_add_btn.setEnabled(True)    # Re-enable the Add button
+        self._on_cleanup_roots_changed()         # Re-evaluate Remove button state
+        self.status_label.setText(f"שגיאה בסריקה: {message}")  # Display the error so the user knows what went wrong
 
     # --- File opening ---
 
@@ -421,6 +788,60 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         else:  # All deletions succeeded
             self.status_label.setText(  # Update status bar with deletion summary
                 f"הועברו לאשפה {len(to_delete)} קבצים | חסכון: {format_total_size(saved_bytes)}"  # "X files moved to Recycle Bin | Saved: Y MB"
+            )
+
+    def _delete_checked_rows(self, table: QTableWidget, name_col: int, folder_col: int):  # Shared deletion handler for Large Files and Old Files tables
+        to_delete = []  # Collect (row_index, full_path, size_bytes) for every checked row before touching anything
+
+        for row in range(table.rowCount()):
+            chk_item = table.item(row, 0)  # Checkbox is always in column 0 for both cleanup tables
+            if chk_item and chk_item.checkState() == Qt.CheckState.Checked:
+                name       = table.item(row, name_col).text()    # File name from the caller-supplied column
+                folder     = table.item(row, folder_col).text()  # Parent folder from the caller-supplied column
+                size_bytes = chk_item.data(Qt.ItemDataRole.UserRole)  # Raw bytes stored at population time — no string parsing needed
+                full_path  = os.path.join(folder, name)
+                to_delete.append((row, full_path, size_bytes))
+
+        if not to_delete:
+            self.status_label.setText("לא נבחרו קבצים למחיקה")  # "No files selected for deletion"
+            return
+
+        total_bytes = sum(size for _, _, size in to_delete)
+        confirm = QMessageBox.question(
+            self,
+            "אישור מחיקה",  # "Confirm deletion"
+            f"האם להעביר לאשפה {len(to_delete)} קבצים ({format_total_size(total_bytes)})?",  # "Move X files (Y) to Recycle Bin?"
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,  # Default to No so an accidental Enter press does not delete anything
+        )
+
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        failed_paths: set[str] = set()  # Track paths that could not be trashed so rows are not removed from the table
+
+        for _row, full_path, _size in to_delete:
+            try:
+                send2trash(full_path)  # Move to Recycle Bin — recoverable if the user made a mistake
+            except Exception:
+                failed_paths.add(full_path)  # Record only the path; the row stays in the table so the user can retry
+
+        # Remove rows bottom-to-top so earlier indices stay valid as rows are removed
+        for row in sorted(
+            (row for row, path, _ in to_delete if path not in failed_paths),
+            reverse=True,
+        ):
+            table.removeRow(row)
+
+        saved_bytes = sum(size for _, path, size in to_delete if path not in failed_paths)
+
+        if failed_paths:
+            self.status_label.setText(
+                f"נמחקו חלקית — {len(failed_paths)} שגיאות | {len(to_delete) - len(failed_paths)} הועברו לאשפה"
+            )
+        else:
+            self.status_label.setText(
+                f"הועברו לאשפה {len(to_delete)} קבצים | חסכון: {format_total_size(saved_bytes)}"  # "X files moved to Recycle Bin | Saved: Y"
             )
 
     # --- Filtering ---
@@ -571,6 +992,154 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         self.delete_btn.setEnabled(dup_count > 0)      # Enable the delete button only if there is at least one duplicate group to act on
         self.select_dups_btn.setEnabled(dup_count > 0)  # Enable the auto-select button under the same condition
         self.deselect_btn.setEnabled(dup_count > 0)     # Enable the deselect button under the same condition
+
+    def _populate_large_files(self, files: list[dict]):  # Fill the Large Files table with files that meet or exceed the size threshold
+        threshold_bytes = self.large_size_spin.value() * 1_048_576  # Convert the spinbox MB value to bytes for comparison
+
+        large = sorted(  # Filter and sort in one step: largest files first so the worst offenders appear at the top
+            (f for f in files if f["size_bytes"] >= threshold_bytes),
+            key=lambda f: f["size_bytes"],
+            reverse=True,
+        )
+
+        self.large_files_table.setRowCount(len(large))  # Resize the table to match the number of qualifying files
+        total_bytes = 0  # Accumulate total size for the summary label
+
+        for row, file in enumerate(large):
+            chk_item = QTableWidgetItem()  # Checkbox cell — no display text
+            chk_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)  # Checkable but not text-editable
+            chk_item.setCheckState(Qt.CheckState.Unchecked)  # Start every row unticked
+            chk_item.setData(Qt.ItemDataRole.UserRole, file["size_bytes"])  # Store raw bytes for deletion total calculation
+
+            name_item = QTableWidgetItem(file["name"])
+            name_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            size_item = QTableWidgetItem(format_size(file["size_bytes"]))
+            size_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            folder_item = QTableWidgetItem(file["folder"])
+            folder_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            self.large_files_table.setItem(row, 0, chk_item)
+            self.large_files_table.setItem(row, 1, name_item)
+            self.large_files_table.setItem(row, 2, size_item)
+            self.large_files_table.setItem(row, 3, folder_item)
+
+            total_bytes += file["size_bytes"]
+
+        count = len(large)
+        self.large_files_label.setText(f"{count} קבצים גדולים | {format_total_size(total_bytes)}")  # Update the summary label
+        self.large_delete_btn.setEnabled(count > 0)  # Enable the delete button only when there is something to delete
+
+    def _populate_old_files(self, files: list[dict]):  # Fill the Old Files table with files not modified within the threshold
+        months = self.old_months_spin.value()
+        cutoff = datetime.now() - timedelta(days=months * 30)  # Approximate: 30 days per month (precise enough for this use case)
+
+        old = sorted(  # Filter and sort: oldest files first so the most neglected files appear at the top
+            (f for f in files if f["modified_date"] < cutoff),
+            key=lambda f: f["modified_date"],
+        )
+
+        self.old_files_table.setRowCount(len(old))  # Resize the table to match the number of qualifying files
+        total_bytes = 0  # Accumulate total size for the summary label
+
+        for row, file in enumerate(old):
+            chk_item = QTableWidgetItem()  # Checkbox cell — no display text
+            chk_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)  # Checkable but not text-editable
+            chk_item.setCheckState(Qt.CheckState.Unchecked)  # Start every row unticked
+            chk_item.setData(Qt.ItemDataRole.UserRole, file["size_bytes"])  # Store raw bytes for deletion total calculation
+
+            name_item = QTableWidgetItem(file["name"])
+            name_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            size_item = QTableWidgetItem(format_size(file["size_bytes"]))
+            size_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            date_item = QTableWidgetItem(file["modified_date"].strftime("%d/%m/%Y"))  # Show last-modified date so the user can verify why the file was flagged
+            date_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            folder_item = QTableWidgetItem(file["folder"])
+            folder_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            self.old_files_table.setItem(row, 0, chk_item)
+            self.old_files_table.setItem(row, 1, name_item)
+            self.old_files_table.setItem(row, 2, size_item)
+            self.old_files_table.setItem(row, 3, date_item)
+            self.old_files_table.setItem(row, 4, folder_item)
+
+            total_bytes += file["size_bytes"]
+
+        count = len(old)
+        self.old_files_label.setText(f"{count} קבצים ישנים | {format_total_size(total_bytes)}")  # Update the summary label
+        self.old_delete_btn.setEnabled(count > 0)  # Enable the delete button only when there is something to delete
+
+    def _populate_heavy_folders(self, files: list[dict]):  # Fill the Heavy Folders table with the 10 largest immediate-parent folders
+        folder_sizes: dict[str, int] = {}   # Maps each folder path to the combined byte count of its direct-child files
+        folder_counts: dict[str, int] = {}  # Maps each folder path to the count of its direct-child files
+
+        for file in files:  # Single pass: accumulate size and count per folder
+            folder = file["folder"]  # Immediate parent path — no recursive aggregation, exactly as clarified in the plan
+            folder_sizes[folder]  = folder_sizes.get(folder, 0)  + file["size_bytes"]
+            folder_counts[folder] = folder_counts.get(folder, 0) + 1
+
+        top10 = sorted(folder_sizes.items(), key=lambda x: x[1], reverse=True)[:10]  # Pick the 10 folders with the most bytes
+
+        self.heavy_folders_table.setRowCount(len(top10))  # Resize the table to at most 10 rows
+
+        for row, (folder, total_bytes) in enumerate(top10):
+            folder_item = QTableWidgetItem(folder)
+            folder_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            size_item = QTableWidgetItem(format_total_size(total_bytes))
+            size_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            count_item = QTableWidgetItem(str(folder_counts[folder]))
+            count_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            self.heavy_folders_table.setItem(row, 0, folder_item)
+            self.heavy_folders_table.setItem(row, 1, size_item)
+            self.heavy_folders_table.setItem(row, 2, count_item)
+
+    def _populate_cleanup_duplicates(self, duplicates: dict[str, list[dict]]):  # Fill the Duplicate Files table from the hash→files mapping produced by CleanupWorker
+        # Flatten all groups into a list of (is_keeper, file_dict) pairs.
+        # Within each group, sort by filename alphabetically and keep the first copy; mark the rest for deletion.
+        rows: list[tuple[bool, dict]] = []  # (keep, file) — True = Unchecked (kept copy), False = Checked (suggested for deletion)
+        savings_bytes = 0  # Bytes that could be freed by deleting all non-kept copies
+
+        for group in duplicates.values():  # Each value is a list of file dicts that share the same SHA-256 hash
+            sorted_group = sorted(group, key=lambda f: f["name"].lower())  # Alphabetical by name — deterministic and easy to understand
+            for i, file in enumerate(sorted_group):
+                rows.append((i == 0, file))  # First entry is the keeper; all others are pre-selected for deletion
+            group_size = sorted_group[0]["size_bytes"]  # All copies are byte-for-byte identical, so any one has the right size
+            savings_bytes += group_size * (len(sorted_group) - 1)  # One copy kept; the rest is reclaimable space
+
+        self.cleanup_dup_table.setRowCount(len(rows))  # Resize the table to the total number of duplicate file rows
+
+        for row, (keep, file) in enumerate(rows):
+            chk_item = QTableWidgetItem()  # Checkbox cell — no display text
+            chk_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)  # Checkable but not text-editable
+            chk_item.setCheckState(Qt.CheckState.Unchecked if keep else Qt.CheckState.Checked)  # Keeper stays unticked; surplus copies pre-ticked
+            chk_item.setData(Qt.ItemDataRole.UserRole, file["size_bytes"])  # Store raw bytes so _delete_checked_rows can total them without parsing
+
+            name_item = QTableWidgetItem(file["name"])
+            name_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            size_item = QTableWidgetItem(format_size(file["size_bytes"]))
+            size_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            folder_item = QTableWidgetItem(file["folder"])
+            folder_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            self.cleanup_dup_table.setItem(row, 0, chk_item)
+            self.cleanup_dup_table.setItem(row, 1, name_item)
+            self.cleanup_dup_table.setItem(row, 2, size_item)
+            self.cleanup_dup_table.setItem(row, 3, folder_item)
+
+        group_count = len(duplicates)
+        self.cleanup_dup_label.setText(
+            f"{group_count} קבוצות כפולות | ניתן לפנות: {format_total_size(savings_bytes)}"  # "X duplicate groups | Reclaimable: Y MB"
+        )
+        self.cleanup_dup_delete_btn.setEnabled(group_count > 0)  # Enable the delete button only when there is at least one duplicate group
 
 
 # ---------------------------------------------------------------------------
