@@ -1,5 +1,6 @@
-import sys   # Import sys to access command-line arguments and exit functionality
-import os    # Import os for os.startfile() to open files with their default application
+import sys       # Import sys to access command-line arguments and exit functionality
+import os        # Import os for os.startfile() to open files with their default application
+import threading  # Import threading for Event-based stop flag coordination between the main and worker threads
 from PyQt6.QtWidgets import (  # Import all needed Qt widgets
     QApplication, QMainWindow, QWidget,  # Core window and container widgets
     QVBoxLayout, QHBoxLayout,  # Vertical and horizontal layout managers
@@ -19,9 +20,8 @@ from PyQt6.QtGui import (  # Import GUI-level classes
     QBrush,         # Wraps QColor into a brush accepted by QTableWidgetItem.setBackground()
 )
 from datetime import datetime, timedelta  # Import datetime for date comparisons; timedelta for the "older than N months" cutoff
-from pathlib import Path  # Import Path for the module-level _walk_clean helper used by CleanupWorker
+from pathlib import Path  # Import Path for the module-level _walk_clean helper used by ScanWorker
 from send2trash import send2trash  # Import send2trash to move files to the Recycle Bin instead of permanently deleting them
-from scanner import scan_folder  # Import the folder scanning generator from scanner.py
 from duplicates import find_duplicates  # Import the duplicate detection function from duplicates.py
 
 
@@ -29,95 +29,76 @@ from duplicates import find_duplicates  # Import the duplicate detection functio
 # Background workers
 # ---------------------------------------------------------------------------
 
-class ScanWorker(QThread):  # Worker that runs scan_folder() on a background thread so the UI stays responsive
-    total_files = pyqtSignal(int)  # Emitted once with the total file count before scanning begins, so the progress bar can set its maximum
-    progress    = pyqtSignal(int)  # Emitted after each file is found; carries the 1-based running count for setValue()
-    finished    = pyqtSignal(list) # Emitted with the complete file list when the scan is done
-    error       = pyqtSignal(str)  # Emitted with an error message string if an exception is raised
+class ScanWorker(QThread):  # Single unified worker: scans all roots, emits the file list immediately, then hashes for duplicates
+    total_files      = pyqtSignal(int)   # Emitted once before scanning with the combined file count; switches the bar from indeterminate to percentage mode
+    progress         = pyqtSignal(int)   # Emitted after each file is discovered; drives progress bar setValue + status label during the scan pass
+    files_ready      = pyqtSignal(list)  # Emitted as soon as scanning finishes — Tab 1 populates immediately without waiting for hashing
+    hash_start       = pyqtSignal(int)   # Emitted before hashing begins with len(files) as the new bar maximum; resets the bar for the hash pass
+    hash_progress    = pyqtSignal(int)   # Emitted after each file is hashed; drives only progress bar setValue — never touches the status label
+    duplicates_ready = pyqtSignal(dict)  # Emitted when hashing completes; Tab 2 duplicate section populates from this
+    stopped          = pyqtSignal()      # Emitted instead of duplicates_ready when stop() is called before the run completes
+    error            = pyqtSignal(str)   # Emitted with an error message string if any unrecoverable exception is raised
 
-    def __init__(self, folder_path: str):  # Accept the folder path at construction time
-        super().__init__()  # Initialize the parent QThread
-        self._folder_path = folder_path  # Store the path so run() can access it
+    def __init__(self, roots: list[str]):  # Accept the list of root paths from the shared panel
+        super().__init__()
+        self._roots = roots  # Never mutated after construction
+        self._stop_event = threading.Event()  # Shared flag; main thread sets it via stop(), worker checks it in run()
 
-    def run(self):  # Qt calls this method in the background thread when start() is invoked
-        try:
-            from pathlib import Path  # Import Path here to count files before the generator runs
-            total = sum(1 for e in Path(self._folder_path).rglob("*") if e.is_file())  # Count every file in the tree upfront so we can show real percentages
-            self.total_files.emit(total)  # Send the total to the main thread so it can set the progress bar maximum
-
-            files = []  # Accumulate file dicts as they arrive from the generator
-            for file in scan_folder(self._folder_path):  # Iterate the generator one file at a time
-                files.append(file)  # Add the file dict to the growing list
-                self.progress.emit(len(files))  # Emit the current count; main thread calls setValue() with this value
-            self.finished.emit(files)  # Send the complete list to the main thread when all files are found
-        except Exception as e:  # Catch any unexpected error (permission denied, OS error, etc.)
-            self.error.emit(str(e))  # Emit the error message so the main thread can display it
-
-
-class DuplicatesWorker(QThread):  # Worker that runs find_duplicates() on a background thread so the UI stays responsive
-    total_files = pyqtSignal(int)  # Emitted once with the total file count before hashing begins, so the progress bar can set its maximum
-    progress    = pyqtSignal(int)  # Emitted after each file is hashed; carries the 1-based running count for setValue()
-    finished    = pyqtSignal(dict) # Emitted with the duplicates dict when hashing completes successfully
-    error       = pyqtSignal(str)  # Emitted with an error message string if an exception is raised
-
-    def __init__(self, file_list: list[dict]):  # Accept the scanned file list at construction time
-        super().__init__()  # Initialize the parent QThread
-        self._file_list = file_list  # Store the file list so run() can access it
-
-    def run(self):  # Qt calls this method in the background thread when start() is invoked
-        try:
-            self.total_files.emit(len(self._file_list))  # Total is known upfront from the list length; no pre-count pass needed
-            result = find_duplicates(self._file_list, on_progress=self.progress.emit)  # Pass the progress signal's emit as the callback so each hashed file increments the bar
-            self.finished.emit(result)  # Send the result back to the main thread via signal
-        except Exception as e:  # Catch any unexpected error (permission denied, OS error, etc.)
-            self.error.emit(str(e))  # Emit the error message so the main thread can display it
-
-
-class CleanupWorker(QThread):  # Worker that scans one or more root paths, then hashes for duplicates, entirely on the background thread
-    total_files   = pyqtSignal(int)  # Emitted once before scanning begins with the combined file count, so the progress bar can set its maximum
-    progress      = pyqtSignal(int)  # Emitted after each file is discovered during the scan pass; drives progress bar + status label
-    hash_start    = pyqtSignal(int)  # Emitted once before hashing begins with len(files) as the new bar maximum; resets the bar for the hash phase
-    hash_progress = pyqtSignal(int)  # Emitted after each file is hashed; drives only progress bar setValue — never touches the status label
-    finished      = pyqtSignal(list, dict)  # Emitted with (file_list, duplicates_dict) when both scan and hash passes complete
-    error         = pyqtSignal(str)  # Emitted with an error message string if any unrecoverable exception is raised
-
-    def __init__(self, roots: list[str]):  # Accept the list of root paths chosen in the multi-root picker
-        super().__init__()  # Initialise the parent QThread
-        self._roots = roots  # Store the root list so run() can access it; never mutated after construction
+    def stop(self):  # Called from the main thread to request cancellation; threading.Event.set() is thread-safe
+        print("stop() called")
+        self._stop_event.set()
 
     def run(self):  # Qt calls this in the background thread when start() is invoked
         try:
             # --- Pre-count pass: use _walk_clean so the count matches what the scan pass will actually visit ---
             total = sum(
-                sum(1 for _ in _walk_clean(Path(root)))  # Count accessible, non-skipped files under this root
+                sum(1 for _ in _walk_clean(Path(root)))
                 for root in self._roots
             )
-            self.total_files.emit(total)  # Send the combined total so the progress bar switches from indeterminate to percentage mode
+            self.total_files.emit(total)  # Progress bar switches from indeterminate to percentage mode
 
-            # --- Scan pass: iterate _walk_clean for every root and build file dicts on the fly ---
-            files = []  # Flat list that collects file dicts from all roots in sequence
+            # --- Scan pass: build file dicts and emit files_ready as soon as the list is complete ---
+            files = []
             for root in self._roots:
-                for entry in _walk_clean(Path(root)):  # Same skip-aware, PermissionError-safe walk as the count pass
+                for entry in _walk_clean(Path(root)):  # Skip-aware, PermissionError-safe walk
                     try:
-                        stat = entry.stat()  # Read filesystem metadata; may raise OSError if the file vanished between discovery and stat
+                        stat = entry.stat()  # May raise OSError if the file vanished between discovery and stat
                     except OSError:
-                        continue  # Skip any file that can no longer be read without aborting the whole scan
-                    files.append({  # Build the same file-dict shape that scanner.py produces so all downstream code stays compatible
+                        continue
+                    files.append({
                         "name":          entry.name,
                         "size_bytes":    stat.st_size,
                         "file_type":     entry.suffix.lstrip(".").lower(),
                         "modified_date": datetime.fromtimestamp(stat.st_mtime),
                         "folder":        str(entry.parent),
                     })
-                    self.progress.emit(len(files))  # Advance the progress bar one step per file
+                    self.progress.emit(len(files))
+                    if self._stop_event.is_set():  # Check after every file; exits both the entry and root loops
+                        print("stop flag checked — stopping scan loop")
+                        self.stopped.emit()
+                        return
 
-            # --- Hash pass: find duplicates among the collected files on this thread so the main thread stays responsive ---
-            self.hash_start.emit(len(files))  # Signal the main thread to reset the progress bar for the hash phase
-            duplicates = find_duplicates(files, on_progress=self.hash_progress.emit)  # Reuse duplicates.py; hash_progress drives only the bar
-            self.finished.emit(files, duplicates)  # Deliver both the file list and the duplicates dict in a single signal
+            self.files_ready.emit(files)  # Tab 1 populates immediately — hashing has not started yet
 
-        except Exception as e:  # Catch any unexpected error not already handled inside the loops
-            self.error.emit(str(e))  # Emit the message so the main thread can display it in the status bar
+            if self._stop_event.is_set():  # Guard the brief window between files_ready and the hash pass starting
+                self.stopped.emit()
+                return
+
+            # --- Hash pass: find duplicates; Tab 2 duplicate section populates when this completes ---
+            self.hash_start.emit(len(files))  # Reset the bar for the hash phase
+            duplicates = find_duplicates(
+                files,
+                on_progress=self.hash_progress.emit,
+                stop_event=self._stop_event,  # Lets find_duplicates break out early between files
+            )
+            if self._stop_event.is_set():  # find_duplicates returned early; emit stopped instead of duplicates_ready
+                self.stopped.emit()
+                return
+
+            self.duplicates_ready.emit(duplicates)
+
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +128,7 @@ FILE_TYPE_GROUPS: dict[str, set[str]] = {  # Maps each Hebrew category label to 
 # Cleanup walk helpers
 # ---------------------------------------------------------------------------
 
-# Directory path prefixes that CleanupWorker never recurses into (case-insensitive).
+# Directory path prefixes that ScanWorker never recurses into (case-insensitive).
 # These are system-owned trees where user storage savings are impossible or dangerous.
 _CLEANUP_SKIP_PREFIXES: tuple[str, ...] = (
     r"C:\Windows",                       # OS installation files
@@ -207,8 +188,6 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         self.resize(900, 600)  # Set the initial window size to 900 wide by 600 tall (pixels)
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)  # Enable RTL layout for Hebrew text support
 
-        self._scanned_files: list[dict] = []  # Cache the last scan results so find_duplicates can reuse them without re-scanning
-
         central_widget = QWidget()  # Create a plain widget to serve as the central container
         self.setCentralWidget(central_widget)  # Set it as the main content area of the window
 
@@ -216,26 +195,44 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         main_layout.setContentsMargins(8, 8, 8, 8)  # Set 8px padding around the edges of the layout
         main_layout.setSpacing(6)  # Set 6px gap between each section in the layout
 
-        # --- Top Bar ---
-        top_bar = QHBoxLayout()  # Create a horizontal layout for the top bar row
+        # --- Shared Panel: multi-root picker + scan button ---
+        self.roots_list = QListWidget()  # Lists all root folders the user has selected for scanning
+        self.roots_list.setFixedHeight(80)  # Compact height so the list doesn't crowd the tabs below
+        self.roots_list.itemSelectionChanged.connect(self._on_roots_selection_changed)  # Gate the Remove button on selection
 
-        self.select_btn = QPushButton("בחר תיקייה")  # Button to open the folder picker dialog
-        self.select_btn.setFixedWidth(120)  # Fix the button width so it doesn't stretch
-        self.select_btn.clicked.connect(self.choose_folder)  # Connect click to choose_folder method
+        self.add_root_btn = QPushButton("הוסף תיקייה")  # Opens a folder picker and appends the chosen path
+        self.add_root_btn.setFixedWidth(120)
+        self.add_root_btn.clicked.connect(self._on_add_root)
 
-        self.dup_btn = QPushButton("מצא כפילויות")  # Button to trigger duplicate detection
-        self.dup_btn.setFixedWidth(120)  # Fix the button width so it doesn't stretch
-        self.dup_btn.setEnabled(False)  # Disabled until a folder has been scanned
-        self.dup_btn.clicked.connect(self.find_dups)  # Connect click to find_dups method
+        self.remove_root_btn = QPushButton("הסר")  # Removes the selected root from the list
+        self.remove_root_btn.setFixedWidth(80)
+        self.remove_root_btn.setEnabled(False)  # Disabled until the user selects an item
+        self.remove_root_btn.clicked.connect(self._on_remove_root)
 
-        self.path_label = QLabel("לא נבחרה תיקייה")  # Label showing the selected folder path
-        self.path_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # Right-align for RTL readability
+        self.scan_all_btn = QPushButton("סרוק הכל")  # Starts the unified ScanWorker across all roots
+        self.scan_all_btn.setFixedWidth(100)
+        self.scan_all_btn.setEnabled(False)  # Disabled until at least one root is in the list
+        self.scan_all_btn.clicked.connect(self._start_scan)  # Wired to the unified scan entry point added in Task 6
 
-        top_bar.addWidget(self.select_btn)  # Add the folder button to the top bar
-        top_bar.addWidget(self.dup_btn)  # Add the duplicates button next to it
-        top_bar.addWidget(self.path_label, stretch=1)  # Path label fills the remaining space
+        self.stop_btn = QPushButton("עצור סריקה")  # Cancels the running scan; disabled until a scan starts
+        self.stop_btn.setFixedWidth(110)
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(lambda: self.worker.stop())
 
-        main_layout.addLayout(top_bar)  # Add the top bar into the main vertical layout
+        shared_btn_row = QHBoxLayout()  # Add / Remove on the right (RTL); Scan pinned to the left
+        shared_btn_row.addWidget(self.add_root_btn)
+        shared_btn_row.addWidget(self.remove_root_btn)
+        shared_btn_row.addStretch()
+        shared_btn_row.addWidget(self.stop_btn)
+        shared_btn_row.addWidget(self.scan_all_btn)
+
+        shared_panel = QVBoxLayout()  # Label → list → buttons
+        shared_panel.setSpacing(4)
+        shared_panel.addWidget(QLabel("תיקיות לסריקה:"))
+        shared_panel.addWidget(self.roots_list)
+        shared_panel.addLayout(shared_btn_row)
+
+        main_layout.addLayout(shared_panel)  # Shared panel sits above the progress bar and tabs
 
         # --- Progress Bar ---
         self.progress_bar = QProgressBar()  # Create the progress bar widget
@@ -251,13 +248,13 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         self.tabs = QTabWidget()  # Create the tab container that holds both views
         self.tabs.setLayoutDirection(Qt.LayoutDirection.RightToLeft)  # Apply RTL to tab labels as well
 
-        # Tab 1 — Scan results
-        self.table = _make_table(  # Build the scan table using the shared helper
-            ["שם", "גודל", "סוג", "תאריך שינוי", "תיקייה"],  # Columns: Name, Size, Type, Modified Date, Folder
-            stretch_col=4,  # Stretch the Folder column to fill remaining width
+        # Tab 1 — File Explorer
+        self.table = _make_table(  # Build the file explorer table using the shared helper
+            ["", "שם", "גודל", "סוג", "תאריך שינוי", "תיקייה"],  # Col 0 = checkbox; then Name, Size, Type, Modified Date, Folder
+            stretch_col=5,  # Stretch the Folder column to fill remaining width
         )
-        self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)  # Disable row selection entirely so the blue highlight indicators don't appear
-        self.table.cellDoubleClicked.connect(self._on_scan_row_double_clicked)  # Open the file when the user double-clicks any cell in the scan table
+        self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)  # No blue row highlight — checkboxes are the selection mechanism
+        self.table.cellDoubleClicked.connect(self._on_scan_row_double_clicked)  # Open the file when the user double-clicks any cell
 
         # Search bar
         self.search_input = QLineEdit()  # Full-width text input for filtering rows by filename
@@ -295,88 +292,32 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         filter_bar.addWidget(self.date_combo)  # Date range dropdown
         filter_bar.addStretch()  # Push all controls to the right, leaving empty space on the left
 
-        scan_tab_widget = QWidget()  # Container widget that holds the filter bar and scan table for tab 1
-        scan_tab_layout = QVBoxLayout(scan_tab_widget)  # Vertical layout stacks the filter bar above the table
+        self.explorer_delete_btn = QPushButton("מחק נבחרים")  # Sends all checked files in the explorer to the Recycle Bin
+        self.explorer_delete_btn.setEnabled(False)  # Disabled until the table is populated with results
+        self.explorer_delete_btn.clicked.connect(
+            lambda: self._delete_checked_rows(self.table, name_col=1, folder_col=5)
+        )
+
+        explorer_footer = QHBoxLayout()  # Footer row: delete button pinned to the left (RTL)
+        explorer_footer.addStretch()
+        explorer_footer.addWidget(self.explorer_delete_btn)
+
+        scan_tab_widget = QWidget()  # Container widget for the file explorer tab
+        scan_tab_layout = QVBoxLayout(scan_tab_widget)  # Vertical layout stacks search bar, filter bar, table, footer
         scan_tab_layout.setContentsMargins(0, 4, 0, 0)  # Small top margin so the search bar doesn't touch the tab edge
         scan_tab_layout.setSpacing(4)  # Small gap between each row in the tab
         scan_tab_layout.addLayout(search_row)  # Search bar sits at the very top of the tab
         scan_tab_layout.addLayout(filter_bar)  # Filter bar sits directly below the search bar
         scan_tab_layout.addWidget(self.table, stretch=1)  # Table expands to fill all remaining vertical space
+        scan_tab_layout.addLayout(explorer_footer)  # Delete button sits below the table
 
-        self.tabs.addTab(scan_tab_widget, "סריקה")  # Add the container as the first tab labelled "Scan"
+        self.tabs.addTab(scan_tab_widget, "סייר קבצים")  # Add the container as the first tab labelled "File Explorer"
 
-        # Tab 2 — Duplicates
-        self.dup_table = _make_table(  # Build the duplicates table using the shared helper
-            ["", "שם", "גודל", "תיקייה", "קבוצה"],  # Col 0 is the checkbox (no header text); then Name, Size, Folder, Group
-            stretch_col=3,  # Stretch the Folder column (now col 3) to fill remaining width
-        )
-        self.dup_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)  # Disable row selection entirely so the blue highlight indicators don't appear
-        self.dup_table.cellDoubleClicked.connect(self._on_dup_row_double_clicked)  # Open the file when the user double-clicks any cell in the duplicates table
-
-        self.select_dups_btn = QPushButton("בחר כפולים")  # Button that auto-checks all but the first file in every duplicate group
-        self.select_dups_btn.setEnabled(False)  # Disabled until the duplicates table is populated with results
-        self.select_dups_btn.clicked.connect(self._select_duplicates)  # Connect click to the auto-select handler
-
-        self.deselect_btn = QPushButton("בטל בחירה")  # Button that unchecks every checkbox in the duplicates table at once
-        self.deselect_btn.setEnabled(False)  # Disabled until the duplicates table is populated with results
-        self.deselect_btn.clicked.connect(self._deselect_all)  # Connect click to the deselect handler
-
-        self.delete_btn = QPushButton("מחק נבחרים")  # Button that sends all checked files to the Recycle Bin
-        self.delete_btn.setEnabled(False)  # Disabled until the duplicates table is populated with results
-        self.delete_btn.clicked.connect(self._delete_selected)  # Connect click to the deletion handler
-
-        dup_bottom_bar = QHBoxLayout()  # Horizontal layout so all buttons sit side by side at the bottom of the tab
-        dup_bottom_bar.addWidget(self.select_dups_btn)  # "Select duplicates" button on the right side (RTL)
-        dup_bottom_bar.addWidget(self.deselect_btn)  # "Deselect all" button next to it
-        dup_bottom_bar.addWidget(self.delete_btn)  # "Delete selected" button next to it
-        dup_bottom_bar.addStretch()  # Push all buttons to the right, leaving empty space on the left
-
-        dup_tab_widget = QWidget()  # Container widget that holds the table and the button bar for tab 2
-        dup_tab_layout = QVBoxLayout(dup_tab_widget)  # Vertical layout stacks the table above the button bar
-        dup_tab_layout.setContentsMargins(0, 0, 0, 0)  # No extra padding inside the tab container
-        dup_tab_layout.setSpacing(4)  # Small gap between table and button bar
-        dup_tab_layout.addWidget(self.dup_table, stretch=1)  # Table expands to fill all available vertical space
-        dup_tab_layout.addLayout(dup_bottom_bar)  # Button bar sits flush at the bottom of the tab
-
-        self.tabs.addTab(dup_tab_widget, "כפילויות")  # Add the container as the second tab labelled "Duplicates"
-
-        # Tab 3 — Storage Cleanup
-        # --- Root picker section ---
-        self.cleanup_roots_list = QListWidget()  # Displays the list of root folders the user has added for cleanup scanning
-        self.cleanup_roots_list.setFixedHeight(100)  # Keep the list compact so it doesn't crowd the sections below it
-        self.cleanup_roots_list.itemSelectionChanged.connect(self._on_cleanup_selection_changed)  # Enable/disable the Remove button based on whether an item is selected
-
-        self.cleanup_add_btn = QPushButton("הוסף תיקייה")  # Opens a folder picker dialog and appends the chosen path to the list
-        self.cleanup_add_btn.setFixedWidth(120)  # Consistent button width
-        self.cleanup_add_btn.clicked.connect(self._on_cleanup_add_root)  # Connect to the add handler
-
-        self.cleanup_remove_btn = QPushButton("הסר")  # Removes the currently selected path from the list
-        self.cleanup_remove_btn.setFixedWidth(80)  # Consistent button width
-        self.cleanup_remove_btn.setEnabled(False)  # Disabled until the user selects an item in the list
-        self.cleanup_remove_btn.clicked.connect(self._on_cleanup_remove_root)  # Connect to the remove handler
-
-        self.cleanup_scan_btn = QPushButton("סרוק")  # Starts the CleanupWorker once at least one root has been added
-        self.cleanup_scan_btn.setFixedWidth(80)  # Consistent button width
-        self.cleanup_scan_btn.setEnabled(False)  # Disabled until at least one root is present in the list
-        self.cleanup_scan_btn.clicked.connect(self._start_cleanup_scan)  # Wire click to the cleanup scan handler
-
-        roots_btn_row = QHBoxLayout()  # Horizontal row that holds the three action buttons for the root picker
-        roots_btn_row.addWidget(self.cleanup_add_btn)   # "Add folder" on the right (RTL)
-        roots_btn_row.addWidget(self.cleanup_remove_btn)  # "Remove" next to it
-        roots_btn_row.addStretch()  # Push buttons right, leaving space on the left
-        roots_btn_row.addWidget(self.cleanup_scan_btn)  # "Scan" pinned to the left edge (RTL: right in layout)
-
-        roots_section = QVBoxLayout()  # Vertical stack for the root-picker header label, list, and buttons
-        roots_section.setSpacing(4)  # Compact spacing between label, list, and buttons
-        roots_section.addWidget(QLabel("תיקיות לסריקה:"))  # Section label: "Folders to scan:"
-        roots_section.addWidget(self.cleanup_roots_list)  # The list of root paths
-        roots_section.addLayout(roots_btn_row)  # Action buttons below the list
-
+        # Tab 2 — Storage Cleanup (root picker moved to the shared panel above the tabs)
         cleanup_tab_widget = QWidget()  # Container widget for the entire cleanup tab
-        cleanup_tab_layout = QVBoxLayout(cleanup_tab_widget)  # Vertical layout stacks the root picker above future sections
+        cleanup_tab_layout = QVBoxLayout(cleanup_tab_widget)  # Vertical layout for the cleanup tab sections
         cleanup_tab_layout.setContentsMargins(0, 4, 0, 0)  # Small top margin so content doesn't touch the tab edge
         cleanup_tab_layout.setSpacing(8)  # Gap between sections
-        cleanup_tab_layout.addLayout(roots_section)  # Root picker stays fixed above the scroll area so it is always visible
 
         # Scroll content widget — wraps all three result sections so the tab is usable at any window height
         scroll_content = QWidget()  # Content widget whose layout holds Large Files, Old Files, and Heavy Folders
@@ -404,7 +345,7 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         self.large_files_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)  # No blue row highlight — checkboxes are the selection mechanism
         self.large_files_table.setMinimumHeight(150)  # Ensure the table is usable even when no results have been loaded yet
 
-        self.large_files_label = QLabel("0 קבצים גדולים | 0 MB")  # Summary line updated by _on_cleanup_done in Task 8
+        self.large_files_label = QLabel("0 קבצים גדולים | 0 MB")  # Summary line updated by _on_files_ready
         self.large_files_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # Right-align for RTL consistency
 
         self.large_delete_btn = QPushButton("מחק נבחרים")  # Sends checked large files to the Recycle Bin
@@ -445,7 +386,7 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         self.old_files_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)  # No blue row highlight — checkboxes are the selection mechanism
         self.old_files_table.setMinimumHeight(150)  # Ensure the table is usable even when no results have been loaded yet
 
-        self.old_files_label = QLabel("0 קבצים ישנים | 0 MB")  # Summary line updated by _on_cleanup_done in Task 8
+        self.old_files_label = QLabel("0 קבצים ישנים | 0 MB")  # Summary line updated by _on_files_ready
         self.old_files_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # Right-align for RTL consistency
 
         self.old_delete_btn = QPushButton("מחק נבחרים")  # Sends checked old files to the Recycle Bin
@@ -539,167 +480,112 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
 
         main_layout.addWidget(self.status_label)  # Add the status label at the bottom of the layout
 
-    # --- Scan flow ---
+    # --- Shared root picker ---
 
-    def choose_folder(self):  # Called when the user clicks "בחר תיקייה"
-        folder_path = QFileDialog.getExistingDirectory(  # Open a native OS folder picker dialog
-            self,  # Parent widget centers the dialog over the main window
-            "בחר תיקייה",  # Dialog title in Hebrew
-            "",  # Empty string lets the OS pick the starting directory
+    def _on_add_root(self):  # Called when the user clicks "הוסף תיקייה" in the shared panel
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "בחר תיקייה לסריקה",  # "Select folder to scan"
+            "",
         )
-
-        if not folder_path:  # User cancelled — folder_path is an empty string
-            return  # Do nothing and return early
-
-        self.path_label.setText(folder_path)  # Show the chosen path in the label
-
-        self.select_btn.setEnabled(False)  # Disable the button to prevent a second scan while one is already running
-        self.dup_btn.setEnabled(False)  # Also disable duplicates button until the new scan finishes
-        self.progress_bar.setMaximum(0)  # Reset to indeterminate mode until the worker emits the real total
-        self.progress_bar.setValue(0)  # Reset the fill to empty before the new scan starts
-        self.progress_bar.show()  # Reveal the progress bar while scanning is in progress
-        self.status_label.setText("סורק...")  # Show "Scanning…" so the user knows work is underway
-
-        self.scan_worker = ScanWorker(folder_path)  # Store as self.scan_worker — CRITICAL: a local variable would be garbage-collected immediately
-        self.scan_worker.total_files.connect(self.progress_bar.setMaximum)  # Wire total count → setMaximum so the bar switches from indeterminate to percentage mode
-        self.scan_worker.progress.connect(self.progress_bar.setValue)       # Wire per-file count → setValue so the bar fills as files are found
-        self.scan_worker.progress.connect(self._on_scan_progress)           # Also update the status label text with the live count
-        self.scan_worker.finished.connect(self._on_scan_done)               # Connect finished signal BEFORE start()
-        self.scan_worker.error.connect(self._on_scan_error)                 # Connect error signal BEFORE start()
-        self.scan_worker.start()                                             # Launch the background thread; run() executes on the worker thread
-
-    def _on_scan_progress(self, count: int):  # Called on the main thread each time the worker finds another file
-        self.status_label.setText(f"סורק... {count} קבצים")  # Update the status label with the live file count
-
-    def _on_scan_done(self, files: list[dict]):  # Called on the main thread when the worker emits finished — safe to update UI here
-        self._scanned_files = files  # Cache the results for the duplicates worker to reuse later
-        self.progress_bar.hide()  # Hide the progress bar now that scanning is complete
-        self.select_btn.setEnabled(True)  # Re-enable the folder button so the user can scan a different folder
-        self.dup_btn.setEnabled(True)  # Enable the duplicates button now that we have data to search
-        self._populate_scan_table(files)  # Fill tab 1 with the scan results
-        self.tabs.setCurrentIndex(0)  # Switch to the scan tab so the user sees results immediately
-
-    def _on_scan_error(self, message: str):  # Called on the main thread when the scan worker emits error
-        self.progress_bar.hide()  # Hide the progress bar since the operation ended (with failure)
-        self.select_btn.setEnabled(True)  # Re-enable the button so the user can try again
-        self.status_label.setText(f"שגיאה: {message}")  # Display the error in the status bar
-
-    # --- Duplicates flow ---
-
-    def find_dups(self):  # Called when the user clicks "מצא כפילויות"
-        self.dup_btn.setEnabled(False)  # Disable the button to prevent starting a second search while one is running
-        self.select_btn.setEnabled(False)  # Disable the scan button too so state cannot change mid-search
-        self.progress_bar.setMaximum(0)  # Reset to indeterminate mode until the worker emits the real total
-        self.progress_bar.setValue(0)  # Reset the fill to empty before the new search starts
-        self.progress_bar.show()  # Show the progress bar while hashing runs in the background
-        self.status_label.setText("מחפש כפילויות...")  # Show a "searching…" message in the status bar
-
-        self.dup_worker = DuplicatesWorker(self._scanned_files)  # Store as self.dup_worker — CRITICAL: a local variable would be garbage-collected immediately
-        self.dup_worker.total_files.connect(self.progress_bar.setMaximum)  # Wire total count → setMaximum so the bar switches from indeterminate to percentage mode
-        self.dup_worker.progress.connect(self.progress_bar.setValue)       # Wire per-file count → setValue so the bar fills as files are hashed
-        self.dup_worker.finished.connect(self._on_dups_done)               # Connect finished signal BEFORE start() so no result can be missed
-        self.dup_worker.error.connect(self._on_dups_error)                 # Connect error signal BEFORE start() for the same reason
-        self.dup_worker.start()                                             # Launch the background thread; run() executes on the worker thread
-
-    def _on_dups_done(self, duplicates: dict):  # Called on the main thread when the duplicates worker emits finished — safe to update UI here
-        self.progress_bar.hide()  # Hide the progress bar now that hashing is complete
-        self.dup_btn.setEnabled(True)  # Re-enable the duplicates button
-        self.select_btn.setEnabled(True)  # Re-enable the scan button
-        self._populate_dup_table(duplicates)  # Fill tab 2 with the duplicate results
-        self.tabs.setCurrentIndex(1)  # Switch to the duplicates tab so the user sees results immediately
-
-    def _on_dups_error(self, message: str):  # Called on the main thread when the duplicates worker emits error
-        self.progress_bar.hide()  # Hide the progress bar since the operation ended (with failure)
-        self.dup_btn.setEnabled(True)  # Re-enable so the user can try again
-        self.select_btn.setEnabled(True)  # Re-enable the scan button as well
-        self.status_label.setText(f"שגיאה: {message}")  # Display the error in the status bar
-
-    # --- Cleanup root picker ---
-
-    def _on_cleanup_add_root(self):  # Called when the user clicks "הוסף תיקייה"
-        path = QFileDialog.getExistingDirectory(  # Open a native folder picker dialog
-            self,  # Parent widget centers the dialog over the main window
-            "בחר תיקייה לסריקה",  # Dialog title: "Select folder to scan"
-            "",  # Let the OS choose the starting directory
-        )
-        if not path:  # User cancelled — path is an empty string
+        if not path:
             return
 
-        existing = [self.cleanup_roots_list.item(i).text()  # Build a list of already-added paths
-                    for i in range(self.cleanup_roots_list.count())]
+        existing = [self.roots_list.item(i).text()
+                    for i in range(self.roots_list.count())]
         if path in existing:  # Skip duplicates — the same root cannot appear twice
             return
 
-        self.cleanup_roots_list.addItem(path)  # Append the new path to the visible list
-        self._on_cleanup_roots_changed()  # Update the scan button state
+        self.roots_list.addItem(path)
+        self._on_roots_changed()
 
-    def _on_cleanup_remove_root(self):  # Called when the user clicks "הסר"
-        selected = self.cleanup_roots_list.selectedItems()  # Get the currently highlighted items
-        for item in selected:  # Remove each selected item (usually just one)
-            self.cleanup_roots_list.takeItem(self.cleanup_roots_list.row(item))  # Remove by row index
-        self._on_cleanup_roots_changed()  # Update the scan button state
+    def _on_remove_root(self):  # Called when the user clicks "הסר" in the shared panel
+        selected = self.roots_list.selectedItems()
+        for item in selected:
+            self.roots_list.takeItem(self.roots_list.row(item))
+        self._on_roots_changed()
 
-    def _on_cleanup_selection_changed(self):  # Called whenever the selection in the roots list changes
-        has_selection = bool(self.cleanup_roots_list.selectedItems())  # True if at least one item is highlighted
-        self.cleanup_remove_btn.setEnabled(has_selection)  # Enable Remove only when something is selected
+    def _on_roots_selection_changed(self):  # Called whenever the selection in the shared roots list changes
+        has_selection = bool(self.roots_list.selectedItems())
+        self.remove_root_btn.setEnabled(has_selection)
 
-    def _on_cleanup_roots_changed(self):  # Updates button states whenever the roots list contents change
-        has_roots = self.cleanup_roots_list.count() > 0  # True if at least one root has been added
-        self.cleanup_scan_btn.setEnabled(has_roots)  # Enable Scan only when there is something to scan
+    def _on_roots_changed(self):  # Updates button states whenever the shared roots list contents change
+        has_roots = self.roots_list.count() > 0
+        self.scan_all_btn.setEnabled(has_roots)
 
-    # --- Cleanup scan flow ---
+    # --- Unified scan flow ---
 
-    def _start_cleanup_scan(self):  # Called when the user clicks "סרוק" in the cleanup tab
+    def _start_scan(self):  # Called when the user clicks "סרוק הכל" in the shared panel
         roots = [
-            self.cleanup_roots_list.item(i).text()  # Read each root path from the list widget by index
-            for i in range(self.cleanup_roots_list.count())
+            self.roots_list.item(i).text()
+            for i in range(self.roots_list.count())
         ]
 
-        self.cleanup_scan_btn.setEnabled(False)   # Prevent a second scan from starting while one is already running
-        self.cleanup_add_btn.setEnabled(False)    # Disable Add so the root list cannot change mid-scan
-        self.cleanup_remove_btn.setEnabled(False) # Disable Remove for the same reason
+        self.scan_all_btn.setEnabled(False)    # Prevent a second scan while one is already running
+        self.add_root_btn.setEnabled(False)    # Root list must not change mid-scan
+        self.remove_root_btn.setEnabled(False)
+        self.explorer_delete_btn.setEnabled(False)  # Disable while results are being replaced
 
-        self.progress_bar.setMaximum(0)   # Reset to indeterminate (pulsing) mode until the worker emits the real total
-        self.progress_bar.setValue(0)     # Clear the fill before the new scan starts
-        self.progress_bar.show()          # Reveal the progress bar while scanning is in progress
-        self.status_label.setText("סורק לניקוי...")  # "Scanning for cleanup…"
+        self.progress_bar.setMaximum(0)  # Indeterminate (pulsing) mode until total_files arrives
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
+        self.status_label.setText("סורק...")  # "Scanning…"
 
-        self.cleanup_worker = CleanupWorker(roots)  # Store as self.cleanup_worker — CRITICAL: a local variable would be garbage-collected immediately
-        self.cleanup_worker.total_files.connect(self.progress_bar.setMaximum)      # Switch bar from indeterminate to percentage mode when the scan total arrives
-        self.cleanup_worker.progress.connect(self.progress_bar.setValue)         # Advance the bar one step per file during the scan pass
-        self.cleanup_worker.progress.connect(self._on_cleanup_scan_progress)     # Update the status label with the live scan count
-        self.cleanup_worker.hash_start.connect(self._on_cleanup_hash_start)      # Reset bar and status label when the hash pass begins
-        self.cleanup_worker.hash_progress.connect(self.progress_bar.setValue)    # Advance the bar one step per file during the hash pass — no status label side-effect
-        self.cleanup_worker.finished.connect(self._on_cleanup_done)              # Connect finished signal BEFORE start()
-        self.cleanup_worker.error.connect(self._on_cleanup_error)                # Connect error signal BEFORE start()
-        self.cleanup_worker.start()                                               # Launch the background thread
+        self.worker = ScanWorker(roots)  # CRITICAL: stored on self so it is not garbage-collected
+        self.worker.total_files.connect(self.progress_bar.setMaximum)   # Switch bar to percentage mode
+        self.worker.progress.connect(self.progress_bar.setValue)         # Advance bar per file (scan pass)
+        self.worker.progress.connect(self._on_scan_progress)            # Update status label with live count
+        self.worker.files_ready.connect(self._on_files_ready)           # Tab 1 + Tab 2 large/old/heavy populate
+        self.worker.hash_start.connect(self._on_hash_start)             # Reset bar for the hash pass
+        self.worker.hash_progress.connect(self.progress_bar.setValue)   # Advance bar per file (hash pass only)
+        self.worker.duplicates_ready.connect(self._on_duplicates_ready) # Tab 2 dup section populates
+        self.worker.stopped.connect(self._on_scan_stopped)              # User cancelled mid-scan
+        self.worker.error.connect(self._on_scan_error)
+        self.stop_btn.setEnabled(True)  # Allow the user to cancel now that the worker exists
+        self.worker.start()  # All signals connected — safe to launch the background thread
 
-    def _on_cleanup_scan_progress(self, count: int):  # Called on the main thread each time the worker finds another file during the scan pass
-        self.status_label.setText(f"סורק לניקוי... {count} קבצים")  # Live count so the user sees progress during long scans
+    def _on_scan_progress(self, count: int):  # Called on the main thread after each file is discovered
+        self.status_label.setText(f"סורק... {count} קבצים")
 
-    def _on_cleanup_hash_start(self, total: int):  # Called on the main thread when the worker transitions from scanning to hashing
-        self.progress_bar.setMaximum(total)  # Reset the bar maximum to the number of files about to be hashed
-        self.progress_bar.setValue(0)        # Reset the fill so the bar sweeps from 0 % to 100 % again during hashing
-        self.status_label.setText("מחפש כפילויות...")  # "Finding duplicates…" — stays fixed while hash_progress silently drives the bar
+    def _on_files_ready(self, files: list[dict]):  # Called when the scan pass finishes — hashing has not yet begun
+        self._populate_scan_table(files)          # Fill Tab 1; also calls _apply_filters → updates status label
+        self.tabs.setCurrentIndex(0)              # Switch to the file explorer so results are immediately visible
+        self._populate_large_files(files)         # Fill Tab 2 large-files section
+        self._populate_old_files(files)           # Fill Tab 2 old-files section
+        self._populate_heavy_folders(files)       # Fill Tab 2 heavy-folders section
+        # Progress bar stays visible — the hash pass is about to begin
 
-    def _on_cleanup_done(self, files: list[dict], duplicates: dict):  # Called on the main thread when CleanupWorker emits finished(files, duplicates) — safe to update UI here
-        self._cleanup_files = files  # Cache the file list in case the user re-runs with changed thresholds
-        self.progress_bar.hide()  # Hide the progress bar now that both scan and hash passes are complete
-        self.cleanup_scan_btn.setEnabled(True)   # Re-enable so the user can re-scan after changing roots or thresholds
-        self.cleanup_add_btn.setEnabled(True)    # Re-enable the Add button
-        self._on_cleanup_roots_changed()         # Re-evaluate Remove/Scan enabled states based on current list contents
-        self._populate_large_files(files)        # Fill the Large Files section with files that exceed the spinbox threshold
-        self._populate_old_files(files)          # Fill the Old Files section with files older than the spinbox threshold
-        self._populate_heavy_folders(files)      # Fill the Heavy Folders section with the top-10 heaviest immediate-parent folders
-        self._populate_cleanup_duplicates(duplicates)  # Fill the Duplicate Files section with the hashing results from the worker
-        self.status_label.setText(f"סיום סריקה — {len(files)} קבצים")  # "Scan complete — X files"
+    def _on_hash_start(self, total: int):  # Called just before hashing begins
+        self.progress_bar.setMaximum(total)  # Reset bar maximum to file count for the hash pass
+        self.progress_bar.setValue(0)        # Sweep from 0 % again during hashing
+        self.status_label.setText("מחשב כפילויות...")  # "Computing duplicates…" — stays fixed while hash_progress silently drives the bar
 
-    def _on_cleanup_error(self, message: str):  # Called on the main thread when CleanupWorker emits error
-        self.progress_bar.hide()  # Hide the progress bar since the operation ended with failure
-        self.cleanup_scan_btn.setEnabled(True)   # Re-enable so the user can try again
-        self.cleanup_add_btn.setEnabled(True)    # Re-enable the Add button
-        self._on_cleanup_roots_changed()         # Re-evaluate Remove button state
-        self.status_label.setText(f"שגיאה בסריקה: {message}")  # Display the error so the user knows what went wrong
+    def _on_duplicates_ready(self, duplicates: dict):  # Called when hashing finishes — all data is now available
+        self.progress_bar.hide()
+        self.stop_btn.setEnabled(False)
+        self.scan_all_btn.setEnabled(True)
+        self.add_root_btn.setEnabled(True)
+        self._on_roots_changed()                     # Re-evaluate Remove button based on current list contents
+        self._populate_cleanup_duplicates(duplicates)  # Fill Tab 2 duplicate-files section
+        total = self.table.rowCount()                # Total files from the completed scan
+        self.status_label.setText(f"סיום סריקה — {total} קבצים")  # "Scan complete — X files"
+
+    def _on_scan_error(self, message: str):  # Called if the worker raises an unrecoverable exception
+        self.progress_bar.hide()
+        self.stop_btn.setEnabled(False)
+        self.scan_all_btn.setEnabled(True)
+        self.add_root_btn.setEnabled(True)
+        self._on_roots_changed()
+        self.status_label.setText(f"שגיאה: {message}")
+
+    def _on_scan_stopped(self):  # Called when the user cancels mid-scan via the stop button
+        self.progress_bar.hide()
+        self.stop_btn.setEnabled(False)
+        self.scan_all_btn.setEnabled(True)
+        self.add_root_btn.setEnabled(True)
+        self._on_roots_changed()                     # Re-evaluate Remove button based on current list contents
+        # Tab 1 results already populated (if files_ready fired) — leave them intact
+        self.status_label.setText("סריקה הופסקה")  # "Scan stopped"
 
     # --- File opening ---
 
@@ -710,85 +596,10 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         except OSError as e:  # Catch errors such as file not found or no associated application
             self.status_label.setText(f"שגיאה בפתיחת קובץ: {e}")  # Show the error in the status bar so the user knows what went wrong
 
-    def _on_scan_row_double_clicked(self, row: int, _col: int):  # Called when the user double-clicks a row in the scan table
-        name   = self.table.item(row, 0).text()  # Column 0 holds the file name
-        folder = self.table.item(row, 4).text()  # Column 4 holds the parent folder path
+    def _on_scan_row_double_clicked(self, row: int, _col: int):  # Called when the user double-clicks a row in the file explorer table
+        name   = self.table.item(row, 1).text()  # Column 1 holds the file name (col 0 is the checkbox)
+        folder = self.table.item(row, 5).text()  # Column 5 holds the parent folder path
         self._open_file(folder, name)  # Delegate to the shared open helper
-
-    def _on_dup_row_double_clicked(self, row: int, _col: int):  # Called when the user double-clicks a row in the duplicates table
-        name   = self.dup_table.item(row, 1).text()  # Column 1 holds the file name (col 0 is now the checkbox)
-        folder = self.dup_table.item(row, 3).text()  # Column 3 holds the parent folder path (shifted by checkbox col)
-        self._open_file(folder, name)  # Delegate to the shared open helper
-
-    def _deselect_all(self):  # Called when the user clicks "בטל בחירה"
-        for row in range(self.dup_table.rowCount()):  # Iterate every row in the duplicates table
-            self.dup_table.item(row, 0).setCheckState(Qt.CheckState.Unchecked)  # Uncheck the checkbox in column 0
-
-    def _select_duplicates(self):  # Called when the user clicks "בחר כפולים"
-        seen_groups: set[str] = set()  # Tracks which group numbers have already had their first row encountered
-
-        for row in range(self.dup_table.rowCount()):  # Iterate every row top to bottom
-            group = self.dup_table.item(row, 4).text()  # Group number is stored as text in column 4
-            chk_item = self.dup_table.item(row, 0)  # Checkbox item is in column 0
-
-            if group not in seen_groups:  # This is the first row encountered for this group — keep it
-                chk_item.setCheckState(Qt.CheckState.Unchecked)  # Uncheck so the user retains one copy
-                seen_groups.add(group)  # Mark this group as having its keeper row assigned
-            else:  # This is a subsequent duplicate in the same group — mark it for deletion
-                chk_item.setCheckState(Qt.CheckState.Checked)  # Check so the user can delete it in one click
-
-    def _delete_selected(self):  # Called when the user clicks "מחק נבחרים"
-        to_delete = []  # List of (row_index, full_path, size_bytes) for every checked row
-
-        for row in range(self.dup_table.rowCount()):  # Iterate every row in the duplicates table
-            chk_item = self.dup_table.item(row, 0)  # Column 0 holds the checkbox item
-            if chk_item and chk_item.checkState() == Qt.CheckState.Checked:  # Only process rows where the checkbox is ticked
-                name       = self.dup_table.item(row, 1).text()  # File name from column 1
-                folder     = self.dup_table.item(row, 3).text()  # Parent folder from column 3
-                size_bytes = chk_item.data(Qt.ItemDataRole.UserRole)  # Raw byte count stored at population time
-                full_path  = os.path.join(folder, name)  # Reconstruct the absolute path
-                to_delete.append((row, full_path, size_bytes))  # Collect for confirmation and deletion
-
-        if not to_delete:  # Nothing was checked — tell the user and bail out
-            self.status_label.setText("לא נבחרו קבצים למחיקה")  # "No files selected for deletion"
-            return
-
-        total_bytes = sum(size for _, _, size in to_delete)  # Sum of all selected file sizes for the confirmation message
-        confirm = QMessageBox.question(  # Show a native Yes/No confirmation dialog before touching any files
-            self,  # Parent widget centers the dialog over the main window
-            "אישור מחיקה",  # Dialog title: "Confirm deletion"
-            f"האם להעביר לאשפה {len(to_delete)} קבצים ({format_total_size(total_bytes)})?",  # "Move X files (Y MB) to Recycle Bin?"
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,  # Show Yes and No buttons
-            QMessageBox.StandardButton.No,  # Default to No so an accidental Enter press does not delete anything
-        )
-
-        if confirm != QMessageBox.StandardButton.Yes:  # User clicked No or closed the dialog
-            return  # Abort without deleting anything
-
-        failed = []  # Track files that could not be trashed so we can report them
-
-        for _row, full_path, _size in to_delete:  # Attempt to trash each selected file
-            try:
-                send2trash(full_path)  # Move the file to the Recycle Bin; recoverable if the user made a mistake
-            except Exception as e:  # Catch permission errors or missing files
-                failed.append(f"{full_path}: {e}")  # Record the failure message for the status bar
-
-        # Remove successfully deleted rows from the table (iterate in reverse so indices stay valid as rows are removed)
-        deleted_rows = {row for row, path, _ in to_delete if path not in {f for f in failed}}  # Set of rows that were actually deleted
-        for row in sorted(deleted_rows, reverse=True):  # Remove from bottom to top to preserve correct indices
-            self.dup_table.removeRow(row)  # Delete the row from the visible table
-
-        remaining = self.dup_table.rowCount()  # How many rows are left after deletion
-        saved_bytes = sum(size for _, _, size in to_delete) - sum(  # Recalculate savings excluding any failures
-            size for _, path, size in to_delete if path in {f for f in failed}
-        )
-
-        if failed:  # At least one file could not be trashed — show partial-failure message
-            self.status_label.setText(f"נמחקו חלקית — {len(failed)} שגיאות | {remaining} שורות נותרו")
-        else:  # All deletions succeeded
-            self.status_label.setText(  # Update status bar with deletion summary
-                f"הועברו לאשפה {len(to_delete)} קבצים | חסכון: {format_total_size(saved_bytes)}"  # "X files moved to Recycle Bin | Saved: Y MB"
-            )
 
     def _delete_checked_rows(self, table: QTableWidget, name_col: int, folder_col: int):  # Shared deletion handler for Large Files and Old Files tables
         to_delete = []  # Collect (row_index, full_path, size_bytes) for every checked row before touching anything
@@ -857,8 +668,8 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         visible_count = 0  # Running count of rows that pass all filters
         visible_bytes = 0  # Running total bytes of visible rows for the status bar
 
-        for row in range(self.table.rowCount()):  # Check every row in the scan table
-            name_item = self.table.item(row, 0)  # Name cell holds the raw file dict in UserRole
+        for row in range(self.table.rowCount()):  # Check every row in the file explorer table
+            name_item = self.table.item(row, 1)  # Col 1: name cell holds the raw file dict in UserRole
             file = name_item.data(Qt.ItemDataRole.UserRole) if name_item else None  # Retrieve the stored dict
 
             if file is None:  # Row has no data (table is being rebuilt) — leave it visible
@@ -914,84 +725,40 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
 
     # --- Table population ---
 
-    def _populate_scan_table(self, files: list[dict]):  # Fill the scan table with a list of file dicts
+    def _populate_scan_table(self, files: list[dict]):  # Fill the file explorer table with a list of file dicts
         self.table.setRowCount(len(files))  # Resize the table to match the number of files
 
-        total_bytes = 0  # Accumulator for total size across all files
-
         for row, file in enumerate(files):  # Iterate over each file dict with its row index
-            name_item = QTableWidgetItem(file["name"])  # Cell: file name
-            name_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # Right-align
-            name_item.setData(Qt.ItemDataRole.UserRole, file)  # Store the full file dict so _apply_filters can read raw values without parsing display strings
+            chk_item = QTableWidgetItem()  # Col 0: checkbox — no display text
+            chk_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)  # Checkable but not text-editable
+            chk_item.setCheckState(Qt.CheckState.Unchecked)  # Start every row unticked
+            chk_item.setData(Qt.ItemDataRole.UserRole, file["size_bytes"])  # Store raw bytes so _delete_checked_rows can total them
 
-            size_item = QTableWidgetItem(format_size(file["size_bytes"]))  # Cell: formatted size
+            name_item = QTableWidgetItem(file["name"])  # Col 1: file name
+            name_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # Right-align
+            name_item.setData(Qt.ItemDataRole.UserRole, file)  # Store the full file dict so _apply_filters can read raw values
+
+            size_item = QTableWidgetItem(format_size(file["size_bytes"]))  # Col 2: formatted size
             size_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)  # Center-align
 
-            type_item = QTableWidgetItem(file["file_type"] or "—")  # Cell: extension or dash if none
+            type_item = QTableWidgetItem(file["file_type"] or "—")  # Col 3: extension or dash if none
             type_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)  # Center-align
 
-            date_item = QTableWidgetItem(file["modified_date"].strftime("%d/%m/%Y"))  # Cell: date formatted as DD/MM/YYYY
+            date_item = QTableWidgetItem(file["modified_date"].strftime("%d/%m/%Y"))  # Col 4: date formatted as DD/MM/YYYY
             date_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)  # Center-align
 
-            folder_item = QTableWidgetItem(file["folder"])  # Cell: parent folder path
+            folder_item = QTableWidgetItem(file["folder"])  # Col 5: parent folder path
             folder_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # Right-align
 
-            self.table.setItem(row, 0, name_item)   # Insert into column 0 (Name)
-            self.table.setItem(row, 1, size_item)   # Insert into column 1 (Size)
-            self.table.setItem(row, 2, type_item)   # Insert into column 2 (Type)
-            self.table.setItem(row, 3, date_item)   # Insert into column 3 (Date)
-            self.table.setItem(row, 4, folder_item) # Insert into column 4 (Folder)
+            self.table.setItem(row, 0, chk_item)    # Checkbox
+            self.table.setItem(row, 1, name_item)   # Name
+            self.table.setItem(row, 2, size_item)   # Size
+            self.table.setItem(row, 3, type_item)   # Type
+            self.table.setItem(row, 4, date_item)   # Date
+            self.table.setItem(row, 5, folder_item) # Folder
 
-            total_bytes += file["size_bytes"]  # Accumulate file size
-
+        self.explorer_delete_btn.setEnabled(len(files) > 0)  # Enable the delete button now that there are rows to act on
         self._apply_filters()  # Apply any active filters immediately and update the status bar with the visible count
-
-    def _populate_dup_table(self, duplicates: dict[str, list[dict]]):  # Fill the duplicates table from a hash→files mapping
-        rows = [  # Flatten the groups into a list of (group_number, file_dict) tuples for easy row iteration
-            (group_num, file)  # Pair each file with its 1-based group number
-            for group_num, files in enumerate(duplicates.values(), start=1)  # Enumerate groups starting from 1
-            for file in files  # Expand each group into individual file rows
-        ]
-
-        self.dup_table.setRowCount(len(rows))  # Resize the table to the total number of duplicate file rows
-
-        savings_bytes = 0  # Accumulator for wasted space (all but one file per group)
-
-        for row, (group_num, file) in enumerate(rows):  # Iterate with row index, group number, and file dict
-            chk_item = QTableWidgetItem()  # Checkbox cell; no display text — the tick box is the only content
-            chk_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)  # Make the cell checkable and interactive but not editable as text
-            chk_item.setCheckState(Qt.CheckState.Unchecked)  # Start every row unticked
-            chk_item.setData(Qt.ItemDataRole.UserRole, file["size_bytes"])  # Store raw bytes so _delete_selected can calculate totals without parsing formatted strings
-
-            name_item = QTableWidgetItem(file["name"])  # Cell: file name
-            name_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # Right-align
-
-            size_item = QTableWidgetItem(format_size(file["size_bytes"]))  # Cell: formatted file size
-            size_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)  # Center-align
-
-            folder_item = QTableWidgetItem(file["folder"])  # Cell: parent folder path
-            folder_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # Right-align
-
-            group_item = QTableWidgetItem(str(group_num))  # Cell: group number so the user can see which files are paired
-            group_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)  # Center-align
-
-            self.dup_table.setItem(row, 0, chk_item)    # Insert checkbox into column 0
-            self.dup_table.setItem(row, 1, name_item)   # Insert name into column 1 (shifted by checkbox col)
-            self.dup_table.setItem(row, 2, size_item)   # Insert size into column 2
-            self.dup_table.setItem(row, 3, folder_item) # Insert folder into column 3
-            self.dup_table.setItem(row, 4, group_item)  # Insert group into column 4
-
-        for files in duplicates.values():  # Iterate over each duplicate group to calculate savings
-            group_size = files[0]["size_bytes"]  # All files in the group are identical so any one has the right size
-            savings_bytes += group_size * (len(files) - 1)  # Only one copy is needed; the rest is wasted space
-
-        dup_count = len(duplicates)  # Number of unique duplicate groups found
-        self.status_label.setText(  # Update the status bar with duplicate summary
-            f"{dup_count} כפילויות | {format_total_size(savings_bytes)} לחיסכון"  # "X duplicates | Y MB saveable"
-        )
-        self.delete_btn.setEnabled(dup_count > 0)      # Enable the delete button only if there is at least one duplicate group to act on
-        self.select_dups_btn.setEnabled(dup_count > 0)  # Enable the auto-select button under the same condition
-        self.deselect_btn.setEnabled(dup_count > 0)     # Enable the deselect button under the same condition
 
     def _populate_large_files(self, files: list[dict]):  # Fill the Large Files table with files that meet or exceed the size threshold
         threshold_bytes = self.large_size_spin.value() * 1_048_576  # Convert the spinbox MB value to bytes for comparison
@@ -1100,7 +867,7 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
             self.heavy_folders_table.setItem(row, 1, size_item)
             self.heavy_folders_table.setItem(row, 2, count_item)
 
-    def _populate_cleanup_duplicates(self, duplicates: dict[str, list[dict]]):  # Fill the Duplicate Files table from the hash→files mapping produced by CleanupWorker
+    def _populate_cleanup_duplicates(self, duplicates: dict[str, list[dict]]):  # Fill the Duplicate Files table from the hash→files mapping produced by ScanWorker
         # Flatten all groups into a list of (is_keeper, file_dict) pairs.
         # Within each group, sort by filename alphabetically and keep the first copy; mark the rest for deletion.
         rows: list[tuple[bool, dict]] = []  # (keep, file) — True = Unchecked (kept copy), False = Checked (suggested for deletion)
