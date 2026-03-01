@@ -10,7 +10,6 @@ from PyQt6.QtWidgets import (  # Import all needed Qt widgets
     QTabWidget, QProgressBar, QMessageBox,  # Tab container, progress bar, and confirmation dialog widgets
     QComboBox, QLineEdit,  # Dropdown selector and single-line text input for the filter bar
     QListWidget,  # List widget used in the cleanup tab to display the selected root paths
-    QSpinBox,  # Integer spinbox used in the cleanup tab for the large-file size threshold
     QScrollArea,  # Scrollable viewport that wraps the three cleanup result sections
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal  # Import Qt namespace, thread class, and signal type
@@ -168,9 +167,18 @@ def _make_table(headers: list[str], stretch_col: int) -> QTableWidget:  # Helper
     table = QTableWidget()  # Create a new table widget
     table.setColumnCount(len(headers))  # Set column count to match the number of header labels
     table.setHorizontalHeaderLabels(headers)  # Apply the provided Hebrew header labels
+    name_col = headers.index("שם") if "שם" in headers else -1  # Locate the name column so we can cap its width
     for i in range(len(headers)):  # Loop over every column index
-        mode = QHeaderView.ResizeMode.Stretch if i == stretch_col else QHeaderView.ResizeMode.ResizeToContents  # Stretch the designated column; others fit their content
+        if i == stretch_col:
+            mode = QHeaderView.ResizeMode.Stretch
+        elif i == name_col:
+            mode = QHeaderView.ResizeMode.Fixed  # Fixed so setColumnWidth caps it
+        else:
+            mode = QHeaderView.ResizeMode.ResizeToContents
         table.horizontalHeader().setSectionResizeMode(i, mode)  # Apply the resize mode to this column
+    if name_col >= 0:
+        table.setColumnWidth(name_col, 220)  # Cap name column; long filenames will be elided
+    table.setTextElideMode(Qt.TextElideMode.ElideRight)  # Clip long text with … instead of overflowing
     table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)  # Make all cells read-only
     table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)  # Full-row selection on click
     table.verticalHeader().setVisible(False)  # Hide the row number column on the left
@@ -200,26 +208,35 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         self.roots_list.setFixedHeight(80)  # Compact height so the list doesn't crowd the tabs below
         self.roots_list.itemSelectionChanged.connect(self._on_roots_selection_changed)  # Gate the Remove button on selection
 
-        self.add_root_btn = QPushButton("הוסף תיקייה")  # Opens a folder picker and appends the chosen path
+        self.add_root_btn = QPushButton("➕ הוסף תיקייה")  # Opens a folder picker and appends the chosen path
         self.add_root_btn.setFixedWidth(120)
         self.add_root_btn.clicked.connect(self._on_add_root)
 
-        self.remove_root_btn = QPushButton("הסר")  # Removes the selected root from the list
+        self.remove_root_btn = QPushButton("🗑 הסר")  # Removes the selected root from the list
+        self.remove_root_btn.setObjectName("neutralBtn")
         self.remove_root_btn.setFixedWidth(80)
         self.remove_root_btn.setEnabled(False)  # Disabled until the user selects an item
         self.remove_root_btn.clicked.connect(self._on_remove_root)
 
-        self.scan_all_btn = QPushButton("סרוק הכל")  # Starts the unified ScanWorker across all roots
-        self.scan_all_btn.setFixedWidth(100)
+        self.scan_all_btn = QPushButton("🔍 סרוק הכל")  # Starts the unified ScanWorker across all roots
+        self.scan_all_btn.setMinimumWidth(130)
         self.scan_all_btn.setEnabled(False)  # Disabled until at least one root is in the list
         self.scan_all_btn.clicked.connect(self._start_scan)  # Wired to the unified scan entry point added in Task 6
 
-        self.stop_btn = QPushButton("עצור סריקה")  # Cancels the running scan; disabled until a scan starts
-        self.stop_btn.setFixedWidth(110)
+        self.stop_btn = QPushButton("⏹ עצור")  # Cancels the running scan; disabled until a scan starts
+        self.stop_btn.setObjectName("warningBtn")
+        self.stop_btn.setFixedWidth(90)
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(lambda: self.worker.stop())
 
+        self.dark_mode = False
+        self.theme_btn = QPushButton("🌙")  # Toggles between light and dark theme
+        self.theme_btn.setObjectName("themeBtn")
+        self.theme_btn.setFixedSize(36, 36)
+        self.theme_btn.clicked.connect(self._toggle_theme)
+
         shared_btn_row = QHBoxLayout()  # Add / Remove on the right (RTL); Scan pinned to the left
+        shared_btn_row.addWidget(self.theme_btn)
         shared_btn_row.addWidget(self.add_root_btn)
         shared_btn_row.addWidget(self.remove_root_btn)
         shared_btn_row.addStretch()
@@ -292,7 +309,8 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         filter_bar.addWidget(self.date_combo)  # Date range dropdown
         filter_bar.addStretch()  # Push all controls to the right, leaving empty space on the left
 
-        self.explorer_delete_btn = QPushButton("מחק נבחרים")  # Sends all checked files in the explorer to the Recycle Bin
+        self.explorer_delete_btn = QPushButton("🗑 מחק נבחרים")  # Sends all checked files in the explorer to the Recycle Bin
+        self.explorer_delete_btn.setProperty("danger", "true")
         self.explorer_delete_btn.setEnabled(False)  # Disabled until the table is populated with results
         self.explorer_delete_btn.clicked.connect(
             lambda: self._delete_checked_rows(self.table, name_col=1, folder_col=5)
@@ -333,10 +351,21 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         cleanup_tab_layout.addWidget(scroll_area, stretch=1)  # Scroll area expands to fill all space below the root picker
 
         # --- Large Files section ---
-        self.large_size_spin = QSpinBox()  # Threshold: only files at or above this size (in MB) are shown as large
-        self.large_size_spin.setRange(1, 100_000)  # 1 MB to ~100 GB expressed in megabytes
-        self.large_size_spin.setValue(100)  # Sensible default: flag files of 100 MB or more
-        self.large_size_spin.setSuffix(" MB")  # Unit label appended to the displayed number
+        self.large_size_input = QLineEdit("100")  # Threshold in MB; default 100 MB
+        self.large_size_input.setValidator(QIntValidator(1, 100_000))
+        self.large_size_input.setFixedWidth(56)
+        self.large_size_up = QPushButton("▲")
+        self.large_size_up.setObjectName("stepperBtn")
+        self.large_size_up.setFixedSize(20, 14)
+        self.large_size_up.clicked.connect(
+            lambda: self.large_size_input.setText(str(min(100_000, int(self.large_size_input.text() or "100") + 10)))
+        )
+        self.large_size_down = QPushButton("▼")
+        self.large_size_down.setObjectName("stepperBtn")
+        self.large_size_down.setFixedSize(20, 14)
+        self.large_size_down.clicked.connect(
+            lambda: self.large_size_input.setText(str(max(1, int(self.large_size_input.text() or "100") - 10)))
+        )
 
         self.large_files_table = _make_table(  # Checkbox table that lists files exceeding the size threshold
             ["", "שם", "גודל", "תיקייה"],  # Col 0 = checkbox; then Name, Size, Folder
@@ -348,17 +377,26 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         self.large_files_label = QLabel("0 קבצים גדולים | 0 MB")  # Summary line updated by _on_files_ready
         self.large_files_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # Right-align for RTL consistency
 
-        self.large_delete_btn = QPushButton("מחק נבחרים")  # Sends checked large files to the Recycle Bin
+        self.large_delete_btn = QPushButton("🗑 מחק נבחרים")  # Sends checked large files to the Recycle Bin
+        self.large_delete_btn.setProperty("danger", "true")
         self.large_delete_btn.setEnabled(False)  # Disabled until Task 8 populates the table with results
         self.large_delete_btn.clicked.connect(
             lambda: self._delete_checked_rows(self.large_files_table, name_col=1, folder_col=3)
         )
 
         large_header = QHBoxLayout()  # Header row: section title on the right, threshold control on the left (RTL)
-        large_header.addWidget(QLabel("קבצים גדולים"))  # Section title
+        _lbl = QLabel("קבצים גדולים"); _lbl.setObjectName("sectionTitle"); large_header.addWidget(_lbl)  # Section title
         large_header.addStretch()  # Push the threshold control to the opposite end
-        large_header.addWidget(QLabel("גודל מינימלי:"))  # Spinbox label
-        large_header.addWidget(self.large_size_spin)  # The threshold spinbox
+        large_header.addWidget(QLabel("גודל מינימלי:"))
+        large_header.addWidget(self.large_size_input)
+
+        large_size_stepper = QVBoxLayout()  # Stack ▲ on top of ▼
+        large_size_stepper.setSpacing(1)
+        large_size_stepper.setContentsMargins(0, 0, 0, 0)
+        large_size_stepper.addWidget(self.large_size_up)
+        large_size_stepper.addWidget(self.large_size_down)
+        large_header.addLayout(large_size_stepper)
+        large_header.addWidget(QLabel("MB"))
 
         large_footer = QHBoxLayout()  # Footer row: summary label on the right, delete button on the left (RTL)
         large_footer.addWidget(self.large_files_label)  # Summary: "X קבצים גדולים | Y MB"
@@ -374,10 +412,21 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         scroll_content_layout.addLayout(large_section)  # Large Files section — first in the scrollable area
 
         # --- Old Files section ---
-        self.old_months_spin = QSpinBox()  # Threshold: files not modified within this many months are considered old
-        self.old_months_spin.setRange(1, 120)  # 1 month to 10 years
-        self.old_months_spin.setValue(6)  # Sensible default: flag files untouched for 6 months or more
-        self.old_months_spin.setSuffix(" חודשים")  # Unit label: "months"
+        self.old_months_input = QLineEdit("6")  # Threshold in months; default 6 months
+        self.old_months_input.setValidator(QIntValidator(1, 120))
+        self.old_months_input.setFixedWidth(40)
+        self.old_months_up = QPushButton("▲")
+        self.old_months_up.setObjectName("stepperBtn")
+        self.old_months_up.setFixedSize(20, 14)
+        self.old_months_up.clicked.connect(
+            lambda: self.old_months_input.setText(str(min(120, int(self.old_months_input.text() or "6") + 1)))
+        )
+        self.old_months_down = QPushButton("▼")
+        self.old_months_down.setObjectName("stepperBtn")
+        self.old_months_down.setFixedSize(20, 14)
+        self.old_months_down.clicked.connect(
+            lambda: self.old_months_input.setText(str(max(1, int(self.old_months_input.text() or "6") - 1)))
+        )
 
         self.old_files_table = _make_table(  # Checkbox table that lists files older than the threshold
             ["", "שם", "גודל", "תאריך שינוי", "תיקייה"],  # Col 0 = checkbox; then Name, Size, Modified Date, Folder
@@ -389,17 +438,26 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         self.old_files_label = QLabel("0 קבצים ישנים | 0 MB")  # Summary line updated by _on_files_ready
         self.old_files_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # Right-align for RTL consistency
 
-        self.old_delete_btn = QPushButton("מחק נבחרים")  # Sends checked old files to the Recycle Bin
+        self.old_delete_btn = QPushButton("🗑 מחק נבחרים")  # Sends checked old files to the Recycle Bin
+        self.old_delete_btn.setProperty("danger", "true")
         self.old_delete_btn.setEnabled(False)  # Disabled until Task 8 populates the table with results
         self.old_delete_btn.clicked.connect(
             lambda: self._delete_checked_rows(self.old_files_table, name_col=1, folder_col=4)
         )
 
         old_header = QHBoxLayout()  # Header row: section title on the right, threshold control on the left (RTL)
-        old_header.addWidget(QLabel("קבצים ישנים"))  # Section title
+        _lbl = QLabel("קבצים ישנים"); _lbl.setObjectName("sectionTitle"); old_header.addWidget(_lbl)  # Section title
         old_header.addStretch()  # Push the threshold control to the opposite end
-        old_header.addWidget(QLabel("לא שונה מזה:"))  # Spinbox label: "Not modified for:"
-        old_header.addWidget(self.old_months_spin)  # The threshold spinbox
+        old_header.addWidget(QLabel("לא שונה מזה:"))
+        old_header.addWidget(self.old_months_input)
+
+        old_months_stepper = QVBoxLayout()  # Stack ▲ on top of ▼
+        old_months_stepper.setSpacing(1)
+        old_months_stepper.setContentsMargins(0, 0, 0, 0)
+        old_months_stepper.addWidget(self.old_months_up)
+        old_months_stepper.addWidget(self.old_months_down)
+        old_header.addLayout(old_months_stepper)
+        old_header.addWidget(QLabel("חודשים"))
 
         old_footer = QHBoxLayout()  # Footer row: summary label on the right, delete button on the left (RTL)
         old_footer.addWidget(self.old_files_label)  # Summary: "X קבצים ישנים | Y MB"
@@ -425,7 +483,7 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         self.heavy_folders_table.setMinimumHeight(150)  # Ensure the table is usable even when no results have been loaded yet
 
         heavy_header = QHBoxLayout()  # Header row: section title on the right (RTL)
-        heavy_header.addWidget(QLabel("תיקיות כבדות"))  # Section title: "Heavy Folders"
+        _lbl = QLabel("תיקיות כבדות"); _lbl.setObjectName("sectionTitle"); heavy_header.addWidget(_lbl)  # Section title: "Heavy Folders"
         heavy_header.addStretch()  # Remaining space left empty — no threshold control needed for this section
 
         heavy_section = QVBoxLayout()  # Stacks header → table vertically
@@ -446,14 +504,15 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         self.cleanup_dup_label = QLabel("0 קבוצות כפולות | ניתן לפנות: 0 MB")  # Summary updated by _populate_cleanup_duplicates
         self.cleanup_dup_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # Right-align for RTL consistency
 
-        self.cleanup_dup_delete_btn = QPushButton("מחק נבחרים")  # Sends checked duplicate copies to the Recycle Bin
+        self.cleanup_dup_delete_btn = QPushButton("🗑 מחק נבחרים")  # Sends checked duplicate copies to the Recycle Bin
+        self.cleanup_dup_delete_btn.setProperty("danger", "true")
         self.cleanup_dup_delete_btn.setEnabled(False)  # Disabled until _populate_cleanup_duplicates finds at least one group
         self.cleanup_dup_delete_btn.clicked.connect(
             lambda: self._delete_checked_rows(self.cleanup_dup_table, name_col=1, folder_col=3)
         )
 
         dup_cleanup_header = QHBoxLayout()  # Header row: section title on the right (RTL); no threshold control needed
-        dup_cleanup_header.addWidget(QLabel("קבצים כפולים"))  # Section title: "Duplicate Files"
+        _lbl = QLabel("קבצים כפולים"); _lbl.setObjectName("sectionTitle"); dup_cleanup_header.addWidget(_lbl)  # Section title: "Duplicate Files"
         dup_cleanup_header.addStretch()
 
         dup_cleanup_footer = QHBoxLayout()  # Footer row: summary label on the right, delete button on the left (RTL)
@@ -476,9 +535,318 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
 
         # --- Bottom Status Bar ---
         self.status_label = QLabel("0 קבצים | 0 MB")  # Status bar label; starts with zero counts
+        self.status_label.setObjectName("statusLabel")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignRight)  # Right-align for RTL consistency
 
         main_layout.addWidget(self.status_label)  # Add the status label at the bottom of the layout
+
+        self._apply_stylesheet(False)  # Apply the default light theme on startup
+
+    # --- Theme ---
+
+    def _apply_stylesheet(self, dark: bool):
+        if dark:
+            bg          = "#1A1A2E"
+            surface     = "#16213E"
+            primary     = "#2196F3"
+            primary_dk  = "#1565C0"
+            primary_lt  = "#0D47A1"
+            text        = "#E3F2FD"
+            text_muted  = "#90CAF9"
+            border      = "#1565C0"
+            danger      = "#EF5350"
+            danger_dk   = "#C62828"
+            input_bg    = "#16213E"
+            header_bg   = "#0D47A1"
+            scroll_bg   = "#16213E"
+            scroll_handle = "#1565C0"
+        else:
+            bg          = "#FFFFFF"
+            surface     = "#F5F9FF"
+            primary     = "#2196F3"
+            primary_dk  = "#1565C0"
+            primary_lt  = "#E3F2FD"
+            text        = "#212121"
+            text_muted  = "#546E7A"
+            border      = "#BBDEFB"
+            danger      = "#E53935"
+            danger_dk   = "#B71C1C"
+            input_bg    = "#FFFFFF"
+            header_bg   = "#E3F2FD"
+            scroll_bg   = "#F5F9FF"
+            scroll_handle = "#BBDEFB"
+
+        QApplication.instance().setStyleSheet(f"""
+            /* ── Base ── */
+            QMainWindow, QWidget {{
+                background-color: {bg};
+                color: {text};
+                font-family: Segoe UI, Arial, sans-serif;
+                font-size: 10pt;
+            }}
+
+            /* ── Buttons — primary (blue) ── */
+            QPushButton {{
+                background-color: {primary};
+                color: #FFFFFF;
+                border: none;
+                border-radius: 6px;
+                padding: 6px 14px;
+                font-size: 10pt;
+            }}
+            QPushButton:hover {{
+                background-color: {primary_dk};
+            }}
+            QPushButton:pressed {{
+                background-color: {primary_dk};
+                padding: 7px 13px 5px 15px;
+            }}
+            QPushButton:disabled {{
+                background-color: #9E9E9E;
+                color: #E0E0E0;
+            }}
+
+            /* ── Buttons — danger (red delete buttons) ── */
+            QPushButton[danger="true"] {{
+                background-color: {danger};
+            }}
+            QPushButton[danger="true"]:hover {{
+                background-color: {danger_dk};
+            }}
+            QPushButton[danger="true"]:disabled {{
+                background-color: #9E9E9E;
+                color: #E0E0E0;
+            }}
+
+            /* ── Progress bar ── */
+            QProgressBar {{
+                background-color: {surface};
+                border: 1px solid {border};
+                border-radius: 6px;
+                height: 14px;
+                text-align: center;
+                color: {text};
+                font-size: 9pt;
+            }}
+            QProgressBar::chunk {{
+                background-color: {primary};
+                border-radius: 6px;
+            }}
+
+            /* ── Tabs ── */
+            QTabWidget::pane {{
+                border: 1px solid {border};
+                border-radius: 4px;
+                background-color: {bg};
+            }}
+            QTabBar::tab {{
+                background-color: {bg};
+                color: {text_muted};
+                padding: 8px 18px;
+                border: none;
+                border-bottom: 3px solid transparent;
+                font-size: 10pt;
+            }}
+            QTabBar::tab:selected {{
+                color: {primary};
+                border-bottom: 3px solid {primary};
+                font-weight: bold;
+            }}
+            QTabBar::tab:hover:!selected {{
+                background-color: {primary_lt};
+                color: {text};
+            }}
+
+            /* ── Tables ── */
+            QTableWidget {{
+                background-color: {bg};
+                alternate-background-color: {surface};
+                gridline-color: {border};
+                border: 1px solid {border};
+                border-radius: 4px;
+                selection-background-color: {primary_lt};
+                selection-color: {text};
+            }}
+            QTableWidget::item {{
+                padding: 4px 6px;
+            }}
+            QTableWidget::indicator {{
+                width: 14px;
+                height: 14px;
+                border: 2px solid {text_muted};
+                border-radius: 3px;
+                background-color: transparent;
+            }}
+            QTableWidget::indicator:checked {{
+                background-color: {primary};
+                border-color: {primary};
+            }}
+            QTableWidget::indicator:hover {{
+                border-color: {primary};
+            }}
+            QHeaderView::section {{
+                background-color: {header_bg};
+                color: {text};
+                padding: 6px 8px;
+                border: none;
+                border-right: 1px solid {border};
+                font-weight: bold;
+                font-size: 9pt;
+            }}
+            QHeaderView::section:last {{
+                border-right: none;
+            }}
+
+            /* ── List widget (roots list) ── */
+            QListWidget {{
+                background-color: {input_bg};
+                border: 1px solid {border};
+                border-radius: 4px;
+                padding: 2px;
+                color: {text};
+            }}
+            QListWidget::item:selected {{
+                background-color: {primary};
+                color: #FFFFFF;
+                border-radius: 3px;
+            }}
+            QListWidget::item:hover:!selected {{
+                background-color: {primary_lt};
+            }}
+
+            /* ── Inputs ── */
+            QLineEdit, QComboBox {{
+                background-color: {input_bg};
+                color: {text};
+                border: 1px solid {border};
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 10pt;
+            }}
+            QLineEdit:focus, QComboBox:focus {{
+                border: 1px solid {primary};
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 20px;
+            }}
+
+            /* ── Stepper buttons (▲▼ next to threshold inputs) ── */
+            QPushButton#stepperBtn {{
+                background-color: {header_bg};
+                color: {text};
+                border: 1px solid {border};
+                border-radius: 2px;
+                padding: 0px;
+                font-size: 7pt;
+            }}
+            QPushButton#stepperBtn:hover {{
+                background-color: {primary_lt};
+                border-color: {primary};
+            }}
+            QPushButton#stepperBtn:pressed {{
+                background-color: {border};
+            }}
+
+            /* ── Theme toggle button ── */
+            QPushButton#themeBtn {{
+                background-color: transparent;
+                color: {text};
+                border: 1px solid {border};
+                border-radius: 6px;
+                padding: 0px;
+                font-size: 16pt;
+            }}
+            QPushButton#themeBtn:hover {{
+                background-color: {primary_lt};
+            }}
+
+            /* ── Neutral button (הסר) ── */
+            QPushButton#neutralBtn {{
+                background-color: {bg};
+                color: {text};
+                border: 1px solid {border};
+                border-radius: 6px;
+                padding: 6px 14px;
+            }}
+            QPushButton#neutralBtn:hover {{
+                background-color: {surface};
+                border-color: {primary};
+            }}
+            QPushButton#neutralBtn:disabled {{
+                background-color: {surface};
+                color: {text_muted};
+                border-color: {border};
+            }}
+
+            /* ── Warning button (עצור) ── */
+            QPushButton#warningBtn {{
+                background-color: {bg};
+                color: {text};
+                border: 2px solid #E65100;
+                border-radius: 6px;
+                padding: 6px 14px;
+            }}
+            QPushButton#warningBtn:hover {{
+                background-color: #FFF3E0;
+                border-color: #BF360C;
+            }}
+            QPushButton#warningBtn:disabled {{
+                background-color: {surface};
+                color: {text_muted};
+                border: 1px solid {border};
+            }}
+
+            /* ── Scroll bars ── */
+            QScrollBar:vertical {{
+                background-color: {scroll_bg};
+                width: 8px;
+                border-radius: 4px;
+            }}
+            QScrollBar::handle:vertical {{
+                background-color: {scroll_handle};
+                border-radius: 4px;
+                min-height: 24px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
+            QScrollBar:horizontal {{
+                background-color: {scroll_bg};
+                height: 8px;
+                border-radius: 4px;
+            }}
+            QScrollBar::handle:horizontal {{
+                background-color: {scroll_handle};
+                border-radius: 4px;
+                min-width: 24px;
+            }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+                width: 0px;
+            }}
+
+            /* ── Labels ── */
+            QLabel {{
+                color: {text};
+            }}
+            QLabel#sectionTitle {{
+                color: {text};
+                font-size: 11pt;
+                font-weight: bold;
+            }}
+
+            /* ── Status bar label ── */
+            QLabel#statusLabel {{
+                color: {text_muted};
+                font-size: 9pt;
+                padding: 2px 4px;
+            }}
+        """)
+
+    def _toggle_theme(self):
+        self.dark_mode = not self.dark_mode
+        self.theme_btn.setText("☀️" if self.dark_mode else "🌙")
+        self._apply_stylesheet(self.dark_mode)
 
     # --- Shared root picker ---
 
@@ -761,7 +1129,7 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         self._apply_filters()  # Apply any active filters immediately and update the status bar with the visible count
 
     def _populate_large_files(self, files: list[dict]):  # Fill the Large Files table with files that meet or exceed the size threshold
-        threshold_bytes = self.large_size_spin.value() * 1_048_576  # Convert the spinbox MB value to bytes for comparison
+        threshold_bytes = int(self.large_size_input.text() or "100") * 1_048_576  # Convert the MB input to bytes for comparison
 
         large = sorted(  # Filter and sort in one step: largest files first so the worst offenders appear at the top
             (f for f in files if f["size_bytes"] >= threshold_bytes),
@@ -799,7 +1167,7 @@ class MainWindow(QMainWindow):  # Define the main window class, inheriting from 
         self.large_delete_btn.setEnabled(count > 0)  # Enable the delete button only when there is something to delete
 
     def _populate_old_files(self, files: list[dict]):  # Fill the Old Files table with files not modified within the threshold
-        months = self.old_months_spin.value()
+        months = int(self.old_months_input.text() or "6")
         cutoff = datetime.now() - timedelta(days=months * 30)  # Approximate: 30 days per month (precise enough for this use case)
 
         old = sorted(  # Filter and sort: oldest files first so the most neglected files appear at the top
